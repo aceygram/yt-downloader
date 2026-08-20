@@ -19,7 +19,16 @@ function cookiesArgs() {
   return fs.existsSync(COOKIES_PATH) ? ['--cookies', COOKIES_PATH] : [];
 }
 
-// Maps a friendly quality label to a max-height for the format selector
+// YouTube intermittently returns this error even for valid, playable videos —
+// yt-dlp maintainers have confirmed it's transient and retrying the same
+// command shortly after often succeeds. Detect it so we can auto-retry.
+function isTransientReloadError(stderrText) {
+  return stderrText.includes('The page needs to be reloaded');
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 const QUALITY_HEIGHTS = {
   '360p': 360,
   '480p': 480,
@@ -34,40 +43,16 @@ function isValidYouTubeUrl(url) {
 }
 
 // STEP A: given a URL, tell the frontend which qualities actually exist for this video
-app.post('/formats', (req, res) => {
+app.post('/formats', async (req, res) => {
   const { url } = req.body;
   if (!isValidYouTubeUrl(url)) {
     return res.status(400).json({ error: 'Valid YouTube URL required' });
   }
 
-  // "formats=missing_pot" tells yt-dlp to still list formats that need a PO Token
-  // even when one isn't available — without this, YouTube's highest-res formats
-  // (often 2160p/4K) get silently dropped from the list rather than shown as broken.
-  const ytdlp = spawn('yt-dlp', [
-    '-j', '--no-warnings',
-    '--extractor-args', 'youtube:formats=missing_pot',
-    ...cookiesArgs(),
-    url,
-  ]);
-  let output = '';
-  let errOutput = '';
-
-  ytdlp.stdout.on('data', (d) => (output += d));
-  ytdlp.stderr.on('data', (d) => (errOutput += d));
-
-  ytdlp.on('error', (err) => {
-    console.error('Failed to launch yt-dlp:', err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'yt-dlp is not available on the server', details: err.message });
-    }
-  });
-
-  ytdlp.on('close', (code) => {
-    if (code !== 0) {
-      console.error(errOutput);
-      return res.status(500).json({ error: 'Could not fetch video info', details: errOutput.slice(-500) });
-    }
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
+      const { output } = await fetchVideoInfo(url);
       const info = JSON.parse(output);
       const heights = new Set(
         info.formats
@@ -80,12 +65,46 @@ app.post('/formats', (req, res) => {
         .filter(([, h]) => [...heights].some((videoH) => videoH >= h))
         .map(([label]) => label);
 
-      res.json({ title: info.title, qualities: available });
-    } catch (e) {
-      res.status(500).json({ error: 'Failed to parse video info' });
+      return res.json({ title: info.title, qualities: available });
+    } catch (err) {
+      const isLastAttempt = attempt === maxAttempts;
+      if (isTransientReloadError(err.stderr || '') && !isLastAttempt) {
+        console.warn(`/formats: transient reload error, retrying (attempt ${attempt + 1}/${maxAttempts})...`);
+        await sleep(1000 * attempt); // brief backoff before retrying
+        continue;
+      }
+      console.error(err.stderr || err.message);
+      return res.status(500).json({ error: 'Could not fetch video info', details: (err.stderr || err.message || '').slice(-500) });
     }
-  });
+  }
 });
+
+// Runs `yt-dlp -j` for a URL and resolves with stdout, or rejects with { stderr }
+function fetchVideoInfo(url) {
+  return new Promise((resolve, reject) => {
+    const ytdlp = spawn('yt-dlp', [
+      '-j', '--no-warnings',
+      '--extractor-args', 'youtube:formats=missing_pot',
+      ...cookiesArgs(),
+      url,
+    ]);
+    let output = '';
+    let errOutput = '';
+
+    ytdlp.stdout.on('data', (d) => (output += d));
+    ytdlp.stderr.on('data', (d) => (errOutput += d));
+
+    ytdlp.on('error', (err) => reject({ stderr: `yt-dlp is not available on the server: ${err.message}` }));
+
+    ytdlp.on('close', (code) => {
+      if (code !== 0) {
+        reject({ stderr: errOutput });
+      } else {
+        resolve({ output });
+      }
+    });
+  });
+}
 
 // STEP B: download at the selected quality, with a fallback if the primary attempt fails
 app.post('/download', (req, res) => {
@@ -100,7 +119,7 @@ app.post('/download', (req, res) => {
   attemptDownload(formatSelector, url, res, /* isFallback */ false);
 });
 
-function attemptDownload(formatSelector, url, res, isFallback) {
+function attemptDownload(formatSelector, url, res, isFallback, retryCount = 0) {
   // yt-dlp/ffmpeg can only MERGE separate video+audio streams when writing to a real
   // file on disk — merging directly into a stdout pipe isn't supported and silently
   // produces a broken/audio-only result. So we download+merge into a temp folder,
@@ -136,7 +155,7 @@ function attemptDownload(formatSelector, url, res, isFallback) {
     console.log(d.toString());
   });
 
-  ytdlp.on('close', (code) => {
+  ytdlp.on('close', async (code) => {
     const files = fs.existsSync(tempDir) ? fs.readdirSync(tempDir) : [];
     const finishedFile = files.find((f) => f.startsWith('video.'));
 
@@ -153,6 +172,15 @@ function attemptDownload(formatSelector, url, res, isFallback) {
     }
 
     cleanupTempDir(tempDir);
+
+    // Transient "page needs to be reloaded" errors usually succeed on retry —
+    // try the same quality up to 2 more times before dropping to the fallback.
+    const maxRetries = 2;
+    if (isTransientReloadError(stderrBuffer) && retryCount < maxRetries && !res.headersSent) {
+      console.warn(`Transient reload error, retrying same quality (attempt ${retryCount + 2}/${maxRetries + 1})...`);
+      await sleep(1000 * (retryCount + 1));
+      return attemptDownload(formatSelector, url, res, isFallback, retryCount + 1);
+    }
 
     // If it failed before sending any data, and this wasn't already the fallback attempt,
     // retry once with the android client at a safe low quality (itag 18, 360p)
