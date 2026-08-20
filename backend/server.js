@@ -31,7 +31,14 @@ app.post('/formats', (req, res) => {
     return res.status(400).json({ error: 'Valid YouTube URL required' });
   }
 
-  const ytdlp = spawn('yt-dlp', ['-j', '--no-warnings', url]);
+  // "formats=missing_pot" tells yt-dlp to still list formats that need a PO Token
+  // even when one isn't available — without this, YouTube's highest-res formats
+  // (often 2160p/4K) get silently dropped from the list rather than shown as broken.
+  const ytdlp = spawn('yt-dlp', [
+    '-j', '--no-warnings',
+    '--extractor-args', 'youtube:formats=missing_pot',
+    url,
+  ]);
   let output = '';
   let errOutput = '';
 
@@ -91,6 +98,7 @@ function attemptDownload(formatSelector, url, res, isFallback) {
     '-o', outputTemplate,
     '--merge-output-format', 'mp4',
     '--no-warnings',
+    '--extractor-args', 'youtube:formats=missing_pot',
     url,
   ];
 
