@@ -10,6 +10,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
+
+// Returns ['--cookies', <path>] if a cookies file is present (see entrypoint.sh),
+// otherwise an empty array. YouTube bot-checks datacenter IPs like Railway's
+// aggressively, and cookies from a logged-in session are the main way around it.
+function cookiesArgs() {
+  return fs.existsSync(COOKIES_PATH) ? ['--cookies', COOKIES_PATH] : [];
+}
 
 // Maps a friendly quality label to a max-height for the format selector
 const QUALITY_HEIGHTS = {
@@ -38,6 +46,7 @@ app.post('/formats', (req, res) => {
   const ytdlp = spawn('yt-dlp', [
     '-j', '--no-warnings',
     '--extractor-args', 'youtube:formats=missing_pot',
+    ...cookiesArgs(),
     url,
   ]);
   let output = '';
@@ -46,10 +55,17 @@ app.post('/formats', (req, res) => {
   ytdlp.stdout.on('data', (d) => (output += d));
   ytdlp.stderr.on('data', (d) => (errOutput += d));
 
+  ytdlp.on('error', (err) => {
+    console.error('Failed to launch yt-dlp:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'yt-dlp is not available on the server', details: err.message });
+    }
+  });
+
   ytdlp.on('close', (code) => {
     if (code !== 0) {
       console.error(errOutput);
-      return res.status(500).json({ error: 'Could not fetch video info' });
+      return res.status(500).json({ error: 'Could not fetch video info', details: errOutput.slice(-500) });
     }
     try {
       const info = JSON.parse(output);
@@ -100,11 +116,20 @@ function attemptDownload(formatSelector, url, res, isFallback) {
     '--merge-output-format', 'mp4',
     '--no-warnings',
     '--extractor-args', 'youtube:formats=missing_pot',
+    ...cookiesArgs(),
     url,
   ];
 
   const ytdlp = spawn('yt-dlp', args);
   let stderrBuffer = '';
+
+  ytdlp.on('error', (err) => {
+    console.error('Failed to launch yt-dlp:', err);
+    cleanupTempDir(tempDir);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'yt-dlp is not available on the server', details: err.message });
+    }
+  });
 
   ytdlp.stderr.on('data', (d) => {
     stderrBuffer += d.toString();
@@ -146,6 +171,7 @@ function attemptDownloadFallback(url, res) {
   const args = [
     '-f', 'best[height<=360]',
     '--extractor-args', 'youtube:player_client=android',
+    ...cookiesArgs(),
     '-o', '-',
     url,
   ];
