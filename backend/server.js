@@ -26,20 +26,54 @@ function isTransientReloadError(stderrText) {
   return stderrText.includes('The page needs to be reloaded');
 }
 
+// Node resolves extension-less executables like "yt-dlp" (yt-dlp.exe on Windows)
+// correctly on its own via PATH — no shell needed, and shell:true would pass args
+// unescaped (Node's own deprecation warning), which is a real injection risk here
+// since args include a user-supplied URL.
+function spawnYtDlp(args) {
+  return spawn('yt-dlp', args);
+}
+
+// With cookies present, yt-dlp's automatic client selection leans toward the
+// "web" client, which is the most PO-Token-gated one — this is what was hiding
+// 2160p/4K formats even with formats=missing_pot. Explicitly requesting
+// tv/visionos alongside the default merges in their format lists too, which is
+// exactly what surfaced 4K successfully in earlier CLI testing without cookies.
+const YOUTUBE_EXTRACTOR_ARGS = 'youtube:player_client=default,tv,visionos;formats=missing_pot';
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-const QUALITY_HEIGHTS = {
-  '360p': 360,
-  '480p': 480,
-  '720p': 720,
-  '1080p': 1080,
-  '1440p': 1440,
-  '2160p': 2160, // 4K
-};
+// Each option is a distinct choice offered to the user. WebM (VP9 video + Opus
+// audio) generally compresses more efficiently than MP4's usual H.264/AAC pair,
+// so it can look and sound noticeably better at the same file size — offered as
+// an extra pick at the top tier rather than replacing MP4 everywhere, since MP4
+// has broader compatibility.
+const QUALITY_OPTIONS = [
+  { label: '360p', height: 360, container: 'mp4' },
+  { label: '480p', height: 480, container: 'mp4' },
+  { label: '720p', height: 720, container: 'mp4' },
+  { label: '1080p', height: 1080, container: 'mp4' },
+  { label: '1440p', height: 1440, container: 'mp4' },
+  { label: '2160p (MP4)', height: 2160, container: 'mp4' },
+  { label: '2160p (WebM – best quality)', height: 2160, container: 'webm' },
+];
+
+function findQualityOption(label) {
+  return QUALITY_OPTIONS.find((o) => o.label === label);
+}
 
 function isValidYouTubeUrl(url) {
   return typeof url === 'string' && (url.includes('youtube.com') || url.includes('youtu.be'));
+}
+
+// Some videos (e.g. cinema-aspect-ratio trailers) are wider than standard 16:9,
+// so their "2160p"/"1440p" streams report a raw pixel height below the actual
+// tier (e.g. 3840x1920 labeled 2160p by YouTube, but f.height is only 1920).
+// Deriving an equivalent height from width fixes quality detection for these.
+function effectiveHeight(f) {
+  const widthDerived = f.width ? Math.round((f.width * 9) / 16) : 0;
+  return Math.max(f.height || 0, widthDerived);
 }
 
 // STEP A: given a URL, tell the frontend which qualities actually exist for this video
@@ -54,16 +88,15 @@ app.post('/formats', async (req, res) => {
     try {
       const { output } = await fetchVideoInfo(url);
       const info = JSON.parse(output);
-      const heights = new Set(
-        info.formats
-          .filter((f) => f.height) // only entries that report a resolution
-          .map((f) => f.height)
-      );
 
-      // Only offer qualities that actually exist for this video
-      const available = Object.entries(QUALITY_HEIGHTS)
-        .filter(([, h]) => [...heights].some((videoH) => videoH >= h))
-        .map(([label]) => label);
+      // For each option, check whether a matching format actually exists in
+      // its required container at that effective height — this is what keeps
+      // "2160p (WebM)" from showing on a video that only has it in MP4, etc.
+      const available = QUALITY_OPTIONS.filter((opt) =>
+        info.formats.some(
+          (f) => f.height && f.ext === opt.container && effectiveHeight(f) >= opt.height
+        )
+      ).map((opt) => opt.label);
 
       return res.json({ title: info.title, qualities: available });
     } catch (err) {
@@ -82,9 +115,9 @@ app.post('/formats', async (req, res) => {
 // Runs `yt-dlp -j` for a URL and resolves with stdout, or rejects with { stderr }
 function fetchVideoInfo(url) {
   return new Promise((resolve, reject) => {
-    const ytdlp = spawn('yt-dlp', [
+    const ytdlp = spawnYtDlp([
       '-j', '--no-warnings',
-      '--extractor-args', 'youtube:formats=missing_pot',
+      '--extractor-args', YOUTUBE_EXTRACTOR_ARGS,
       ...cookiesArgs(),
       url,
     ]);
@@ -113,13 +146,22 @@ app.post('/download', (req, res) => {
     return res.status(400).json({ error: 'Valid YouTube URL required' });
   }
 
-  const height = QUALITY_HEIGHTS[quality] || 1080; // default to 1080p if omitted
-  const formatSelector = `bv*[height<=${height}]+ba/b[height<=${height}]`;
+  const option = findQualityOption(quality) || { height: 1080, container: 'mp4' }; // default if omitted/unknown
+  const { height, container } = option;
 
-  attemptDownload(formatSelector, url, res, /* isFallback */ false);
+  // Constrain both video and audio to the requested container so the merge
+  // produces a genuine MP4 (H.264/AAC) or genuine WebM (VP9/Opus) — without
+  // this, yt-dlp could mix codecs and just remux into whichever container we
+  // ask ffmpeg for, losing the actual quality benefit of picking WebM.
+  const formatSelector =
+    container === 'webm'
+      ? `bv*[ext=webm][height<=${height}]+ba[ext=webm]/b[ext=webm][height<=${height}]`
+      : `bv*[ext=mp4][height<=${height}]+ba[ext=m4a]/b[ext=mp4][height<=${height}]`;
+
+  attemptDownload(formatSelector, url, res, /* isFallback */ false, 0, container);
 });
 
-function attemptDownload(formatSelector, url, res, isFallback, retryCount = 0) {
+function attemptDownload(formatSelector, url, res, isFallback, retryCount = 0, container = 'mp4') {
   // yt-dlp/ffmpeg can only MERGE separate video+audio streams when writing to a real
   // file on disk — merging directly into a stdout pipe isn't supported and silently
   // produces a broken/audio-only result. So we download+merge into a temp folder,
@@ -132,14 +174,14 @@ function attemptDownload(formatSelector, url, res, isFallback, retryCount = 0) {
   const args = [
     '-f', formatSelector,
     '-o', outputTemplate,
-    '--merge-output-format', 'mp4',
+    '--merge-output-format', container,
     '--no-warnings',
-    '--extractor-args', 'youtube:formats=missing_pot',
+    '--extractor-args', YOUTUBE_EXTRACTOR_ARGS,
     ...cookiesArgs(),
     url,
   ];
 
-  const ytdlp = spawn('yt-dlp', args);
+  const ytdlp = spawnYtDlp(args);
   let stderrBuffer = '';
 
   ytdlp.on('error', (err) => {
@@ -161,8 +203,9 @@ function attemptDownload(formatSelector, url, res, isFallback, retryCount = 0) {
 
     if (code === 0 && finishedFile) {
       const filePath = path.join(tempDir, finishedFile);
-      res.setHeader('Content-Disposition', `attachment; filename="video${path.extname(finishedFile)}"`);
-      res.setHeader('Content-Type', 'video/mp4');
+      const ext = path.extname(finishedFile);
+      res.setHeader('Content-Disposition', `attachment; filename="video${ext}"`);
+      res.setHeader('Content-Type', container === 'webm' ? 'video/webm' : 'video/mp4');
 
       const readStream = fs.createReadStream(filePath);
       readStream.pipe(res);
@@ -179,7 +222,7 @@ function attemptDownload(formatSelector, url, res, isFallback, retryCount = 0) {
     if (isTransientReloadError(stderrBuffer) && retryCount < maxRetries && !res.headersSent) {
       console.warn(`Transient reload error, retrying same quality (attempt ${retryCount + 2}/${maxRetries + 1})...`);
       await sleep(1000 * (retryCount + 1));
-      return attemptDownload(formatSelector, url, res, isFallback, retryCount + 1);
+      return attemptDownload(formatSelector, url, res, isFallback, retryCount + 1, container);
     }
 
     // If it failed before sending any data, and this wasn't already the fallback attempt,
@@ -207,7 +250,7 @@ function attemptDownloadFallback(url, res) {
   res.setHeader('Content-Disposition', 'attachment; filename="video.mp4"');
   res.setHeader('Content-Type', 'video/mp4');
 
-  const fallback = spawn('yt-dlp', args);
+  const fallback = spawnYtDlp(args);
   fallback.stdout.pipe(res);
   fallback.on('close', (fCode) => {
     if (fCode !== 0 && !res.headersSent) {
