@@ -50,13 +50,13 @@ function sleep(ms) {
 // an extra pick at the top tier rather than replacing MP4 everywhere, since MP4
 // has broader compatibility.
 const QUALITY_OPTIONS = [
-  { id: '360p', label: '360p', height: 360, container: 'mp4' },
-  { id: '480p', label: '480p', height: 480, container: 'mp4' },
-  { id: '720p', label: '720p', height: 720, container: 'mp4' },
-  { id: '1080p', label: '1080p', height: 1080, container: 'mp4' },
-  { id: '1440p', label: '1440p', height: 1440, container: 'mp4' },
-  { id: '2160p-mp4', label: '2160p (MP4)', height: 2160, container: 'mp4' },
-  { id: '2160p-webm', label: '2160p (WebM - best quality)', height: 2160, container: 'webm' },
+  { id: '360p', label: 'MP4 - 360p', height: 360, container: 'mp4' },
+  { id: '480p', label: 'MP4 - 480p', height: 480, container: 'mp4' },
+  { id: '720p', label: 'MP4 - 720p', height: 720, container: 'mp4' },
+  { id: '1080p', label: 'MP4 - 1080p (HD)', height: 1080, container: 'mp4' },
+  { id: '1440p', label: 'MP4 - 1440p (QHD)', height: 1440, container: 'mp4' },
+  { id: '2160p-mp4', label: 'MP4 - 2160p (4K)', height: 2160, container: 'mp4' },
+  { id: '2160p-webm', label: 'WebM - 2160p (4K, best quality)', height: 2160, container: 'webm' },
 ];
 
 function findQualityOption(id) {
@@ -74,6 +74,17 @@ function isValidYouTubeUrl(url) {
 function effectiveHeight(f) {
   const widthDerived = f.width ? Math.round((f.width * 9) / 16) : 0;
   return Math.max(f.height || 0, widthDerived);
+}
+
+// Formats a duration in seconds as "m:ss" or "h:mm:ss" for display in the UI
+function formatDuration(seconds) {
+  if (!seconds && seconds !== 0) return '';
+  const s = Math.round(seconds);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
 }
 
 // STEP A: given a URL, tell the frontend which qualities actually exist for this video
@@ -98,7 +109,13 @@ app.post('/formats', async (req, res) => {
         )
       ).map((opt) => ({ id: opt.id, label: opt.label }));
 
-      return res.json({ title: info.title, qualities: available });
+      return res.json({
+        title: info.title,
+        thumbnail: info.thumbnail,
+        channel: info.uploader || info.channel || '',
+        duration: formatDuration(info.duration),
+        qualities: available,
+      });
     } catch (err) {
       const isLastAttempt = attempt === maxAttempts;
       if (isTransientReloadError(err.stderr || '') && !isLastAttempt) {

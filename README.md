@@ -34,6 +34,10 @@ npm run dev
 ```
 Opens on http://localhost:3000 by default — if the backend is also on 3000 locally, run the frontend with `npm run dev -- -p 3001` and update `NEXT_PUBLIC_BACKEND_URL` accordingly.
 
+The frontend follows the "yt4kSave" design (Tailwind + Hanken Grotesk/Geist/Inter + Material Symbols icons), with two pages:
+- `/` — Download page: paste a link, see a thumbnail/title/channel preview, pick quality/container, download.
+- `/history` — History page: recently downloaded videos, stored in the browser's `localStorage` (the backend deletes each file right after streaming it, so there's nothing server-side to list — history is per-browser, not shared across family members' devices).
+
 ## Deploying
 
 ### Backend -> Railway

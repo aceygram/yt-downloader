@@ -1,0 +1,31 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.material-symbols-outlined {
+  font-variation-settings:
+    'FILL' 0,
+    'wght' 400,
+    'GRAD' 0,
+    'opsz' 24;
+  vertical-align: middle;
+}
+
+.material-symbols-outlined.logo {
+  font-size: 44px;
+}
+
+.icon-fill-1 {
+  font-variation-settings: 'FILL' 1;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* Visible keyboard focus everywhere, since the design's own focus rings are
+   only defined on a few specific elements */
+:focus-visible {
+  outline: 2px solid theme('colors.secondary');
+  outline-offset: 2px;
+}
