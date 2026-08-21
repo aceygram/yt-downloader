@@ -50,17 +50,17 @@ function sleep(ms) {
 // an extra pick at the top tier rather than replacing MP4 everywhere, since MP4
 // has broader compatibility.
 const QUALITY_OPTIONS = [
-  { label: '360p', height: 360, container: 'mp4' },
-  { label: '480p', height: 480, container: 'mp4' },
-  { label: '720p', height: 720, container: 'mp4' },
-  { label: '1080p', height: 1080, container: 'mp4' },
-  { label: '1440p', height: 1440, container: 'mp4' },
-  { label: '2160p (MP4)', height: 2160, container: 'mp4' },
-  { label: '2160p (WebM – best quality)', height: 2160, container: 'webm' },
+  { id: '360p', label: '360p', height: 360, container: 'mp4' },
+  { id: '480p', label: '480p', height: 480, container: 'mp4' },
+  { id: '720p', label: '720p', height: 720, container: 'mp4' },
+  { id: '1080p', label: '1080p', height: 1080, container: 'mp4' },
+  { id: '1440p', label: '1440p', height: 1440, container: 'mp4' },
+  { id: '2160p-mp4', label: '2160p (MP4)', height: 2160, container: 'mp4' },
+  { id: '2160p-webm', label: '2160p (WebM - best quality)', height: 2160, container: 'webm' },
 ];
 
-function findQualityOption(label) {
-  return QUALITY_OPTIONS.find((o) => o.label === label);
+function findQualityOption(id) {
+  return QUALITY_OPTIONS.find((o) => o.id === id);
 }
 
 function isValidYouTubeUrl(url) {
@@ -96,7 +96,7 @@ app.post('/formats', async (req, res) => {
         info.formats.some(
           (f) => f.height && f.ext === opt.container && effectiveHeight(f) >= opt.height
         )
-      ).map((opt) => opt.label);
+      ).map((opt) => ({ id: opt.id, label: opt.label }));
 
       return res.json({ title: info.title, qualities: available });
     } catch (err) {

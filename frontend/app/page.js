@@ -10,7 +10,7 @@ export default function Home() {
   const [status, setStatus] = useState('idle'); // idle | checking | loading | error | done
   const [errorMsg, setErrorMsg] = useState('');
 
-  const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL;
+  const backendUrl = (process.env.NEXT_PUBLIC_BACKEND_URL || '').replace(/\/+$/, '');
 
   const checkFormats = async () => {
     if (!url.trim()) return;
@@ -33,7 +33,7 @@ export default function Home() {
       const data = await res.json();
       setQualities(data.qualities || []);
       setVideoTitle(data.title || '');
-      setSelectedQuality(data.qualities?.[data.qualities.length - 1] || '');
+      setSelectedQuality(data.qualities?.[data.qualities.length - 1]?.id || '');
       setStatus('idle');
     } catch (err) {
       setStatus('error');
@@ -60,10 +60,11 @@ export default function Home() {
       }
 
       const blob = await res.blob();
+      const ext = blob.type === 'video/webm' ? 'webm' : 'mp4';
       const downloadUrl = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = downloadUrl;
-      a.download = `${videoTitle || 'video'}.mp4`;
+      a.download = `${videoTitle || 'video'}.${ext}`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -100,7 +101,7 @@ export default function Home() {
             style={{ width: '100%', padding: 10, fontSize: 16, marginBottom: 12 }}
           >
             {qualities.map((q) => (
-              <option key={q} value={q}>{q}</option>
+              <option key={q.id} value={q.id}>{q.label}</option>
             ))}
           </select>
         </>
