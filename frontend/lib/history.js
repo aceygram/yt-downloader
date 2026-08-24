@@ -45,3 +45,32 @@ export function formatDate(isoString) {
   const d = new Date(isoString);
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 }
+
+// Pending (in-progress) downloads — kept separate from finished history so a
+// closed and reopened tab can find its job again and pick up the live SSE
+// progress instead of losing track of it. The backend keeps a finished job's
+// file available for 1 hour after completion, so there's a real window to
+// come back within.
+const PENDING_KEY = 'yt4ksave-pending';
+
+export function getPending() {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(PENDING_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function addPending(entry) {
+  if (typeof window === 'undefined') return;
+  const pending = getPending().filter((p) => p.jobId !== entry.jobId);
+  window.localStorage.setItem(PENDING_KEY, JSON.stringify([{ startedAt: new Date().toISOString(), ...entry }, ...pending]));
+}
+
+export function removePending(jobId) {
+  if (typeof window === 'undefined') return;
+  const pending = getPending().filter((p) => p.jobId !== jobId);
+  window.localStorage.setItem(PENDING_KEY, JSON.stringify(pending));
+}

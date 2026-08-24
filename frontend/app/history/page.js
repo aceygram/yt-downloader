@@ -2,12 +2,14 @@
 
 import { useEffect, useState } from 'react';
 import Header from '../../components/Header';
-import { getHistory, deleteHistoryEntry, clearHistory, formatBytes, formatDate } from '../../lib/history';
+import PendingDownloads from '../../components/PendingDownloads';
+import { getHistory, deleteHistoryEntry, clearHistory, addPending, removePending, formatBytes, formatDate } from '../../lib/history';
+import { friendlyErrorHint } from '../../lib/errorHints';
 
 export default function History() {
   const [entries, setEntries] = useState([]);
-  const [redownloadingId, setRedownloadingId] = useState(null);
   const [errorMsg, setErrorMsg] = useState('');
+  const [progressByEntry, setProgressByEntry] = useState({}); // id -> { active, percent, message, error }
 
   const backendUrl = (process.env.NEXT_PUBLIC_BACKEND_URL || '').replace(/\/+$/, '');
 
@@ -27,30 +29,62 @@ export default function History() {
 
   const handleRedownload = async (entry) => {
     setErrorMsg('');
-    setRedownloadingId(entry.id);
+    setProgressByEntry((prev) => ({ ...prev, [entry.id]: { active: true, percent: 0, message: 'Starting…', error: '' } }));
+
     try {
-      const res = await fetch(`${backendUrl}/download`, {
+      const res = await fetch(`${backendUrl}/download/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: entry.url, quality: entry.qualityId }),
+        body: JSON.stringify({ url: entry.url, quality: entry.qualityId, title: entry.title || 'video' }),
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || 'Download failed');
+        throw new Error(data.error || 'Could not start download');
       }
-      const blob = await res.blob();
-      const downloadUrl = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = downloadUrl;
-      a.download = `${entry.title}.${entry.container || 'mp4'}`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(downloadUrl);
+      const { jobId } = await res.json();
+      addPending({
+        jobId,
+        url: entry.url,
+        title: entry.title,
+        thumbnail: entry.thumbnail,
+        channel: entry.channel,
+        duration: entry.duration,
+        qualityId: entry.qualityId,
+        qualityLabel: entry.qualityLabel,
+        badge: entry.badge,
+        container: entry.container,
+      });
+
+      const es = new EventSource(`${backendUrl}/download/progress/${jobId}`);
+
+      es.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+
+        if (data.status === 'error') {
+          removePending(jobId);
+          setProgressByEntry((prev) => ({ ...prev, [entry.id]: { active: false, percent: 0, message: '', error: data.error || 'Download failed' } }));
+          es.close();
+          return;
+        }
+
+        setProgressByEntry((prev) => ({ ...prev, [entry.id]: { active: true, percent: data.percent, message: data.message, error: '' } }));
+
+        if (data.status === 'done') {
+          es.close();
+          removePending(jobId);
+          const fileUrl = `${backendUrl}/download/file/${jobId}`;
+          const iframe = document.createElement('iframe');
+          iframe.style.display = 'none';
+          iframe.src = fileUrl;
+          document.body.appendChild(iframe);
+          setTimeout(() => iframe.remove(), 5 * 60 * 1000);
+          setProgressByEntry((prev) => ({ ...prev, [entry.id]: { active: false, percent: 100, message: 'Done', error: '' } }));
+        }
+      };
+
+      es.onerror = () => es.close();
     } catch (err) {
-      setErrorMsg(`Couldn't re-download "${entry.title}": ${err.message}`);
-    } finally {
-      setRedownloadingId(null);
+      setProgressByEntry((prev) => ({ ...prev, [entry.id]: { active: false, percent: 0, message: '', error: err.message } }));
     }
   };
 
@@ -58,6 +92,8 @@ export default function History() {
     <>
       <Header />
       <main className="flex-1 max-w-container-max mx-auto w-full min-w-0 px-margin-mobile md:px-gutter py-stack-md flex flex-col gap-stack-lg pb-24 md:pb-stack-lg overflow-x-hidden">
+        <PendingDownloads onSettled={() => setEntries(getHistory())} />
+
         <section className="flex flex-col sm:flex-row sm:justify-between sm:items-end gap-3 sm:gap-stack-sm">
           <div className="flex flex-col gap-1 min-w-0">
             <h1 className="font-headline-lg-mobile md:font-headline-lg text-headline-lg-mobile md:text-headline-lg text-primary break-words">
@@ -142,24 +178,50 @@ export default function History() {
                       <span className="material-symbols-outlined text-[18px]">check_circle</span>
                       Completed
                     </div>
-                    <div className="flex items-center gap-3 w-full sm:w-auto">
-                      <button
-                        onClick={() => handleDelete(entry.id)}
-                        aria-label="Remove from history"
-                        className="shrink-0 p-2 text-on-surface-variant hover:text-error transition-colors bg-surface-container-low rounded-lg hover:bg-error-container flex items-center justify-center"
-                      >
-                        <span className="material-symbols-outlined text-[20px]">delete</span>
-                      </button>
-                      <button
-                        onClick={() => handleRedownload(entry)}
-                        disabled={redownloadingId === entry.id}
-                        className="flex-1 sm:flex-none justify-center px-4 sm:px-5 py-2.5 bg-primary text-on-primary font-button-text rounded-lg hover:bg-on-background transition-colors flex items-center gap-2 disabled:opacity-50 whitespace-nowrap"
-                      >
-                        <span className="material-symbols-outlined text-[20px]">download</span>
-                        <span className="truncate">
-                          {redownloadingId === entry.id ? 'Downloading…' : 'Download again'}
-                        </span>
-                      </button>
+                    <div className="flex flex-col gap-2 w-full sm:w-auto">
+                      <div className="flex items-center gap-3 w-full sm:w-auto">
+                        <button
+                          onClick={() => handleDelete(entry.id)}
+                          aria-label="Remove from history"
+                          className="shrink-0 p-2 text-on-surface-variant hover:text-error transition-colors bg-surface-container-low rounded-lg hover:bg-error-container flex items-center justify-center"
+                        >
+                          <span className="material-symbols-outlined text-[20px]">delete</span>
+                        </button>
+                        <button
+                          onClick={() => handleRedownload(entry)}
+                          disabled={progressByEntry[entry.id]?.active}
+                          className="flex-1 sm:flex-none justify-center px-4 sm:px-5 py-2.5 bg-primary text-on-primary font-button-text rounded-lg hover:bg-on-background transition-colors flex items-center gap-2 disabled:opacity-50 whitespace-nowrap"
+                        >
+                          <span className="material-symbols-outlined text-[20px]">download</span>
+                          <span className="truncate">
+                            {progressByEntry[entry.id]?.active ? 'Downloading…' : 'Download again'}
+                          </span>
+                        </button>
+                      </div>
+                      {progressByEntry[entry.id]?.active && (
+                        <div className="flex flex-col gap-1 w-full sm:w-48">
+                          <div className="w-full h-1.5 rounded-full bg-surface-container-high overflow-hidden">
+                            <div
+                              className="h-full bg-secondary transition-all duration-300"
+                              style={{ width: `${Math.max(2, progressByEntry[entry.id].percent)}%` }}
+                            />
+                          </div>
+                          <p className="font-label-sm text-[11px] text-on-surface-variant text-right">
+                            {progressByEntry[entry.id].message}{' '}
+                            {progressByEntry[entry.id].percent > 0 ? `(${Math.round(progressByEntry[entry.id].percent)}%)` : ''}
+                          </p>
+                        </div>
+                      )}
+                      {progressByEntry[entry.id]?.error && (
+                        <div className="text-right">
+                          <p className="font-label-sm text-[11px] text-error">
+                            {progressByEntry[entry.id].error}
+                          </p>
+                          <p className="font-label-sm text-[11px] text-on-surface-variant mt-0.5">
+                            {friendlyErrorHint(progressByEntry[entry.id].error)}
+                          </p>
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>

@@ -2,7 +2,9 @@
 
 import { useState } from 'react';
 import Header from '../components/Header';
-import { addHistoryEntry } from '../lib/history';
+import PendingDownloads from '../components/PendingDownloads';
+import { addHistoryEntry, addPending, removePending } from '../lib/history';
+import { friendlyErrorHint } from '../lib/errorHints';
 
 // Maps a quality id to the short badge shown on the video preview thumbnail
 const BADGE_BY_ID = {
@@ -73,53 +75,91 @@ export default function Home() {
     }
   };
 
-  const handleDownload = async () => {
-    if (!url.trim() || !selectedQuality) return;
+  const [dl, setDl] = useState({ active: false, percent: 0, message: '', error: '' });
 
-    setStatus('loading');
-    setErrorMsg('');
+  const handleDownload = async () => {
+    if (!url.trim() || !selectedQuality || dl.active) return;
+
+    setDl({ active: true, percent: 0, message: 'Starting…', error: '' });
 
     try {
-      const res = await fetch(`${backendUrl}/download`, {
+      const res = await fetch(`${backendUrl}/download/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, quality: selectedQuality }),
+        body: JSON.stringify({ url, quality: selectedQuality, title: videoInfo?.title || 'video' }),
       });
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || 'Download failed');
+        throw new Error(data.error || 'Could not start download');
       }
 
-      const blob = await res.blob();
-      const ext = blob.type === 'video/webm' ? 'webm' : 'mp4';
-      const downloadUrl = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = downloadUrl;
-      a.download = `${videoInfo?.title || 'video'}.${ext}`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(downloadUrl);
-
-      const qualityOption = qualities.find((q) => q.id === selectedQuality);
-      addHistoryEntry({
+      const { jobId } = await res.json();
+      const container = selectedQuality.includes('webm') ? 'webm' : 'mp4';
+      addPending({
+        jobId,
         url,
         title: videoInfo?.title || 'video',
         thumbnail: videoInfo?.thumbnail || '',
         channel: videoInfo?.channel || '',
         duration: videoInfo?.duration || '',
         qualityId: selectedQuality,
-        qualityLabel: qualityOption?.label || selectedQuality,
+        qualityLabel: qualities.find((q) => q.id === selectedQuality)?.label || selectedQuality,
         badge: BADGE_BY_ID[selectedQuality] || '',
-        container: ext,
-        sizeBytes: blob.size,
+        container,
       });
 
-      setStatus('done');
+      const es = new EventSource(`${backendUrl}/download/progress/${jobId}`);
+
+      es.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+
+        if (data.status === 'error') {
+          removePending(jobId);
+          setDl({ active: false, percent: 0, message: '', error: data.error || 'Download failed' });
+          es.close();
+          return;
+        }
+
+        setDl({ active: true, percent: data.percent, message: data.message, error: '' });
+
+        if (data.status === 'done') {
+          es.close();
+          removePending(jobId);
+
+          // The file's already fully merged at this point, so fetching it is
+          // fast — a hidden iframe lets the browser handle it as a normal
+          // streamed download without navigating away from this page.
+          const fileUrl = `${backendUrl}/download/file/${jobId}`;
+          const iframe = document.createElement('iframe');
+          iframe.style.display = 'none';
+          iframe.src = fileUrl;
+          document.body.appendChild(iframe);
+          setTimeout(() => iframe.remove(), 5 * 60 * 1000);
+
+          const qualityOption = qualities.find((q) => q.id === selectedQuality);
+          addHistoryEntry({
+            url,
+            title: videoInfo?.title || 'video',
+            thumbnail: videoInfo?.thumbnail || '',
+            channel: videoInfo?.channel || '',
+            duration: videoInfo?.duration || '',
+            qualityId: selectedQuality,
+            qualityLabel: qualityOption?.label || selectedQuality,
+            badge: BADGE_BY_ID[selectedQuality] || '',
+            container,
+          });
+
+          setDl({ active: false, percent: 100, message: 'Done', error: '' });
+        }
+      };
+
+      es.onerror = () => {
+        // Connection hiccup — only treat as fatal if the job itself never resolved
+        es.close();
+      };
     } catch (err) {
-      setStatus('error');
-      setErrorMsg(err.message);
+      setDl({ active: false, percent: 0, message: '', error: err.message });
     }
   };
 
@@ -130,6 +170,8 @@ export default function Home() {
       <Header />
       <main className="flex-grow flex flex-col items-center p-margin-mobile md:p-stack-lg pb-24 md:pb-stack-lg">
         <div className="w-full max-w-container-max flex flex-col gap-stack-lg">
+          <PendingDownloads />
+
           {/* Hero / Input Section */}
           <section className="flex flex-col gap-stack-md text-center py-8">
             <h1 className="font-headline-lg-mobile md:font-headline-lg text-headline-lg-mobile md:text-headline-lg text-primary">
@@ -158,16 +200,35 @@ export default function Home() {
                 <span className="material-symbols-outlined text-on-surface-variant">content_paste</span>
               </button>
             </div>
-            {status === 'checking' && (
-              <p className="font-label-sm text-label-sm text-on-surface-variant">Checking available qualities…</p>
-            )}
             {status === 'error' && (
-              <p className="font-label-sm text-label-sm text-error">{errorMsg}</p>
+              <div className="text-left">
+                <p className="font-label-sm text-label-sm text-error">{errorMsg}</p>
+                <p className="font-label-sm text-label-sm text-on-surface-variant mt-1">{friendlyErrorHint(errorMsg)}</p>
+              </div>
             )}
           </section>
 
+          {/* Skeleton loading state while fetching video info */}
+          {status === 'checking' && (
+            <section className="grid grid-cols-1 md:grid-cols-3 gap-gutter animate-pulse">
+              <div className="md:col-span-2 rounded-2xl border border-outline-variant bg-surface-container-lowest overflow-hidden flex flex-col shadow-sm">
+                <div className="w-full aspect-[1.60] bg-surface-container-high" />
+                <div className="p-6 flex flex-col gap-3">
+                  <div className="h-6 bg-surface-container-high rounded w-3/4" />
+                  <div className="h-4 bg-surface-container-high rounded w-1/2" />
+                </div>
+              </div>
+              <div className="md:col-span-1 rounded-2xl border border-outline-variant bg-surface-container-lowest p-6 flex flex-col gap-stack-md shadow-sm">
+                <div className="h-6 bg-surface-container-high rounded w-2/3" />
+                <div className="h-14 bg-surface-container-high rounded-xl" />
+                <div className="flex-grow" />
+                <div className="h-14 bg-surface-container-high rounded-xl" />
+              </div>
+            </section>
+          )}
+
           {/* Results Section */}
-          {videoInfo && qualities.length > 0 && (
+          {status !== 'checking' && videoInfo && qualities.length > 0 && (
             <section className="grid grid-cols-1 md:grid-cols-3 gap-gutter">
               {/* Video Preview Card */}
               <div className="md:col-span-2 rounded-2xl border border-outline-variant bg-surface-container-lowest overflow-hidden flex flex-col shadow-sm">
@@ -234,19 +295,37 @@ export default function Home() {
                 <div className="flex-grow" />
                 <button
                   onClick={handleDownload}
-                  disabled={status === 'loading' || !selectedQuality}
+                  disabled={!selectedQuality || dl.active}
                   className="w-full h-14 rounded-xl bg-primary text-on-primary font-button-text text-button-text text-lg hover:bg-surface-tint hover:shadow-lg transition-all flex items-center justify-center gap-2 active:scale-95 duration-100 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <span className="material-symbols-outlined">download</span>
-                  {status === 'loading' ? 'Downloading…' : 'Download'}
+                  {dl.active ? 'Downloading…' : 'Download'}
                 </button>
-                {status === 'done' && (
+                {dl.active && (
+                  <div className="flex flex-col gap-1.5">
+                    <div className="w-full h-2 rounded-full bg-surface-container-high overflow-hidden">
+                      <div
+                        className="h-full bg-secondary transition-all duration-300"
+                        style={{ width: `${Math.max(2, dl.percent)}%` }}
+                      />
+                    </div>
+                    <p className="font-label-sm text-label-sm text-on-surface-variant text-center">
+                      {dl.message} {dl.percent > 0 ? `(${Math.round(dl.percent)}%)` : ''}
+                    </p>
+                  </div>
+                )}
+                {!dl.active && dl.percent === 100 && !dl.error && (
                   <p className="font-label-sm text-label-sm text-on-tertiary-container text-center">
-                    Done — check your downloads folder.
+                    Done — check your browser's downloads.
                   </p>
                 )}
-                {status === 'error' && (
-                  <p className="font-label-sm text-label-sm text-error text-center">{errorMsg}</p>
+                {dl.error && (
+                  <div>
+                    <p className="font-label-sm text-label-sm text-error text-center">{dl.error}</p>
+                    <p className="font-label-sm text-label-sm text-on-surface-variant text-center mt-1">
+                      {friendlyErrorHint(dl.error)}
+                    </p>
+                  </div>
                 )}
               </div>
             </section>

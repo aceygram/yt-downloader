@@ -87,6 +87,69 @@ function formatDuration(seconds) {
   return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
 }
 
+// Strips characters that are invalid or risky in filenames across OSes, and
+// caps length, so a video's real title can be used as the download's filename
+// instead of a generic "video.mp4".
+function sanitizeFilename(name) {
+  if (!name) return 'video';
+  const cleaned = name.replace(/[\\/:*?"<>|\u0000-\u001F]/g, '').trim();
+  return cleaned.slice(0, 150) || 'video';
+}
+
+// In-memory download job store. Each job tracks real progress (parsed from
+// yt-dlp's own output) so the frontend can show a live progress bar instead of
+// relying on the browser's download manager, which only shows anything once
+// the full merge is already done and bytes actually start flowing.
+const jobs = new Map();
+
+function createJob() {
+  const id = crypto.randomUUID();
+  const job = {
+    id,
+    status: 'starting', // starting | downloading | merging | retrying | done | error
+    percent: 0,
+    message: 'Starting…',
+    container: 'mp4',
+    filenameBase: 'video',
+    filePath: null,
+    tempDir: null,
+    error: null,
+    createdAt: Date.now(),
+    completedAt: null, // set once status becomes done or error
+  };
+  jobs.set(id, job);
+  return job;
+}
+
+function updateJob(job, patch) {
+  Object.assign(job, patch);
+  if ((patch.status === 'done' || patch.status === 'error') && !job.completedAt) {
+    job.completedAt = Date.now();
+  }
+}
+
+// Sweep abandoned jobs so temp files and memory don't accumulate indefinitely.
+// Finished jobs get a generous window (closing the tab and coming back later to
+// grab the file is a supported flow) — timed from completion, not job start, so
+// a long video that took a while to process doesn't get swept moments after
+// finishing. Jobs that never finish (crashed process, etc.) get a separate,
+// longer safety-net cutoff timed from when they started.
+const COMPLETED_RETENTION_MS = 60 * 60 * 1000; // 1 hour after finishing
+const MAX_PROCESSING_MS = 3 * 60 * 60 * 1000; // 3 hours — should never normally take this long
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    const isFinished = job.status === 'done' || job.status === 'error';
+    const shouldSweep = isFinished
+      ? job.completedAt && now - job.completedAt > COMPLETED_RETENTION_MS
+      : now - job.createdAt > MAX_PROCESSING_MS;
+    if (shouldSweep) {
+      if (job.tempDir) cleanupTempDir(job.tempDir);
+      jobs.delete(id);
+    }
+  }
+}, 5 * 60 * 1000);
+
 // STEP A: given a URL, tell the frontend which qualities actually exist for this video
 app.post('/formats', async (req, res) => {
   const { url } = req.body;
@@ -156,43 +219,130 @@ function fetchVideoInfo(url) {
   });
 }
 
-// STEP B: download at the selected quality, with a fallback if the primary attempt fails
-app.post('/download', (req, res) => {
-  const { url, quality } = req.body;
+// STEP B1: kick off a download job and return its id immediately. The actual
+// yt-dlp work happens in the background — the client tracks it via SSE.
+app.post('/download/start', (req, res) => {
+  const { url, quality, title } = req.body;
   if (!isValidYouTubeUrl(url)) {
     return res.status(400).json({ error: 'Valid YouTube URL required' });
   }
 
-  const option = findQualityOption(quality) || { height: 1080, container: 'mp4' }; // default if omitted/unknown
+  const option = findQualityOption(quality) || { height: 1080, container: 'mp4' };
   const { height, container } = option;
+  const filenameBase = sanitizeFilename(title);
 
-  // Constrain both video and audio to the requested container so the merge
-  // produces a genuine MP4 (H.264/AAC) or genuine WebM (VP9/Opus) — without
-  // this, yt-dlp could mix codecs and just remux into whichever container we
-  // ask ffmpeg for, losing the actual quality benefit of picking WebM.
   const formatSelector =
     container === 'webm'
       ? `bv*[ext=webm][height<=${height}]+ba[ext=webm]/b[ext=webm][height<=${height}]`
       : `bv*[ext=mp4][height<=${height}]+ba[ext=m4a]/b[ext=mp4][height<=${height}]`;
 
-  attemptDownload(formatSelector, url, res, /* isFallback */ false, 0, container);
+  const job = createJob();
+  updateJob(job, { container, filenameBase });
+  res.json({ jobId: job.id });
+
+  runDownloadJob(job, formatSelector, url, container, false, 0);
 });
 
-function attemptDownload(formatSelector, url, res, isFallback, retryCount = 0, container = 'mp4') {
-  // yt-dlp/ffmpeg can only MERGE separate video+audio streams when writing to a real
-  // file on disk — merging directly into a stdout pipe isn't supported and silently
-  // produces a broken/audio-only result. So we download+merge into a temp folder,
-  // then stream the finished file to the browser and delete it right after.
-  const jobId = crypto.randomUUID();
-  const tempDir = path.join(os.tmpdir(), `ytdl-${jobId}`);
+// STEP B2: live progress via Server-Sent Events — the frontend's actual progress bar
+app.get('/download/progress/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).end();
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const send = () => {
+    res.write(`data: ${JSON.stringify({
+      status: job.status,
+      percent: job.percent,
+      message: job.message,
+      error: job.error,
+    })}\n\n`);
+  };
+
+  send();
+  const interval = setInterval(() => {
+    send();
+    if (job.status === 'done' || job.status === 'error') {
+      clearInterval(interval);
+      res.end();
+    }
+  }, 400);
+
+  req.on('close', () => clearInterval(interval));
+});
+
+// STEP B3: once a job is done, this serves the actual finished file — fast,
+// since the merge already happened; the browser handles this as a normal
+// streamed download.
+app.get('/download/file/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job || job.status !== 'done' || !job.filePath || !fs.existsSync(job.filePath)) {
+    return res.status(404).json({ error: 'File not ready or job not found' });
+  }
+
+  const ext = path.extname(job.filePath);
+  res.setHeader('Content-Disposition', `attachment; filename="${job.filenameBase}${ext}"`);
+  res.setHeader('Content-Type', job.container === 'webm' ? 'video/webm' : 'video/mp4');
+
+  const readStream = fs.createReadStream(job.filePath);
+  readStream.pipe(res);
+  const cleanup = () => {
+    cleanupTempDir(job.tempDir);
+    jobs.delete(job.id);
+  };
+  readStream.on('close', cleanup);
+  readStream.on('error', cleanup);
+});
+
+// Parses yt-dlp's own progress lines to drive the job's percent/message.
+// yt-dlp reports each stream's download separately (e.g. video then audio),
+// so we split the overall bar into rough phases rather than trying to get a
+// byte-perfect combined percentage — good enough for a progress indicator.
+function trackProgress(job, line, requiresMerge) {
+  if (/\[download\]\s+Destination:/.test(line)) {
+    job._destinationCount = (job._destinationCount || 0) + 1;
+    if (requiresMerge && job._destinationCount === 2) {
+      updateJob(job, { status: 'downloading', message: 'Downloading audio…' });
+    } else {
+      updateJob(job, { status: 'downloading', message: 'Downloading video…' });
+    }
+    return;
+  }
+
+  const match = line.match(/\[download\]\s+([\d.]+)%/);
+  if (match) {
+    const pct = parseFloat(match[1]);
+    if (!requiresMerge) {
+      updateJob(job, { percent: Math.min(99, pct) });
+    } else if ((job._destinationCount || 1) <= 1) {
+      updateJob(job, { percent: Math.min(70, pct * 0.7) });
+    } else {
+      updateJob(job, { percent: 70 + Math.min(25, pct * 0.25) });
+    }
+    return;
+  }
+
+  if (/\[Merger\]/.test(line)) {
+    updateJob(job, { status: 'merging', message: 'Merging video and audio…', percent: 97 });
+  }
+}
+
+function runDownloadJob(job, formatSelector, url, container, isFallback, retryCount) {
+  const tempDir = path.join(os.tmpdir(), `ytdl-${job.id}`);
   fs.mkdirSync(tempDir, { recursive: true });
+  updateJob(job, { tempDir });
   const outputTemplate = path.join(tempDir, 'video.%(ext)s');
+  const requiresMerge = formatSelector.includes('+');
 
   const args = [
     '-f', formatSelector,
     '-o', outputTemplate,
     '--merge-output-format', container,
     '--no-warnings',
+    '--newline', // one progress line per update instead of \r overwrites — needed to parse it
     '--extractor-args', YOUTUBE_EXTRACTOR_ARGS,
     ...cookiesArgs(),
     url,
@@ -200,13 +350,19 @@ function attemptDownload(formatSelector, url, res, isFallback, retryCount = 0, c
 
   const ytdlp = spawnYtDlp(args);
   let stderrBuffer = '';
+  let stdoutTail = '';
 
   ytdlp.on('error', (err) => {
     console.error('Failed to launch yt-dlp:', err);
     cleanupTempDir(tempDir);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'yt-dlp is not available on the server', details: err.message });
-    }
+    updateJob(job, { status: 'error', error: 'yt-dlp is not available on the server' });
+  });
+
+  ytdlp.stdout.on('data', (d) => {
+    stdoutTail += d.toString();
+    const lines = stdoutTail.split('\n');
+    stdoutTail = lines.pop(); // keep any incomplete trailing line for next chunk
+    lines.forEach((line) => trackProgress(job, line, requiresMerge));
   });
 
   ytdlp.stderr.on('data', (d) => {
@@ -219,59 +375,77 @@ function attemptDownload(formatSelector, url, res, isFallback, retryCount = 0, c
     const finishedFile = files.find((f) => f.startsWith('video.'));
 
     if (code === 0 && finishedFile) {
-      const filePath = path.join(tempDir, finishedFile);
-      const ext = path.extname(finishedFile);
-      res.setHeader('Content-Disposition', `attachment; filename="video${ext}"`);
-      res.setHeader('Content-Type', container === 'webm' ? 'video/webm' : 'video/mp4');
-
-      const readStream = fs.createReadStream(filePath);
-      readStream.pipe(res);
-      readStream.on('close', () => cleanupTempDir(tempDir));
-      readStream.on('error', () => cleanupTempDir(tempDir));
+      updateJob(job, {
+        status: 'done',
+        percent: 100,
+        message: 'Done',
+        filePath: path.join(tempDir, finishedFile),
+      });
       return;
     }
 
     cleanupTempDir(tempDir);
 
-    // Transient "page needs to be reloaded" errors usually succeed on retry —
-    // try the same quality up to 2 more times before dropping to the fallback.
     const maxRetries = 2;
-    if (isTransientReloadError(stderrBuffer) && retryCount < maxRetries && !res.headersSent) {
+    if (isTransientReloadError(stderrBuffer) && retryCount < maxRetries) {
       console.warn(`Transient reload error, retrying same quality (attempt ${retryCount + 2}/${maxRetries + 1})...`);
+      updateJob(job, { status: 'retrying', message: 'Retrying…', percent: 0, _destinationCount: 0 });
       await sleep(1000 * (retryCount + 1));
-      return attemptDownload(formatSelector, url, res, isFallback, retryCount + 1, container);
+      return runDownloadJob(job, formatSelector, url, container, isFallback, retryCount + 1);
     }
 
-    // If it failed before sending any data, and this wasn't already the fallback attempt,
-    // retry once with the android client at a safe low quality (itag 18, 360p)
-    if (!res.headersSent && !isFallback) {
+    if (!isFallback) {
       console.warn('Primary download failed, retrying with android client fallback...');
-      attemptDownloadFallback(url, res);
-    } else if (!res.headersSent) {
-      res.status(500).json({ error: 'Download failed', details: stderrBuffer.slice(-300) });
+      updateJob(job, { status: 'retrying', message: 'Falling back to a lower quality…', percent: 0, _destinationCount: 0 });
+      return runDownloadJobFallback(job, url);
     }
+
+    updateJob(job, { status: 'error', error: stderrBuffer.slice(-300) || 'Download failed' });
   });
 }
 
-function attemptDownloadFallback(url, res) {
+function runDownloadJobFallback(job, url) {
   // itag 18 (360p) is a single progressive stream — video+audio already combined,
-  // no merge needed, so it's safe to pipe straight to stdout.
+  // no merge needed, so it downloads straight to a file just like the main path.
+  const tempDir = path.join(os.tmpdir(), `ytdl-${job.id}-fb`);
+  fs.mkdirSync(tempDir, { recursive: true });
+  updateJob(job, { tempDir, container: 'mp4' });
+  const outputTemplate = path.join(tempDir, 'video.%(ext)s');
+
   const args = [
     '-f', 'best[height<=360]',
+    '-o', outputTemplate,
+    '--no-warnings',
+    '--newline',
     '--extractor-args', 'youtube:player_client=android',
     ...cookiesArgs(),
-    '-o', '-',
     url,
   ];
 
-  res.setHeader('Content-Disposition', 'attachment; filename="video.mp4"');
-  res.setHeader('Content-Type', 'video/mp4');
+  const ytdlp = spawnYtDlp(args);
+  let stdoutTail = '';
 
-  const fallback = spawnYtDlp(args);
-  fallback.stdout.pipe(res);
-  fallback.on('close', (fCode) => {
-    if (fCode !== 0 && !res.headersSent) {
-      res.status(500).json({ error: 'Download failed after retry' });
+  ytdlp.stdout.on('data', (d) => {
+    stdoutTail += d.toString();
+    const lines = stdoutTail.split('\n');
+    stdoutTail = lines.pop();
+    lines.forEach((line) => trackProgress(job, line, false));
+  });
+
+  ytdlp.on('close', (code) => {
+    const files = fs.existsSync(tempDir) ? fs.readdirSync(tempDir) : [];
+    const finishedFile = files.find((f) => f.startsWith('video.'));
+
+    if (code === 0 && finishedFile) {
+      updateJob(job, {
+        status: 'done',
+        percent: 100,
+        message: 'Done',
+        filePath: path.join(tempDir, finishedFile),
+      });
+    } else {
+      cleanupTempDir(tempDir);
+      updateJob(job, { status: 'error', error: 'Download failed after retry' });
     }
   });
 }
