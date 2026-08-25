@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import Header from '../components/Header';
 import PendingDownloads from '../components/PendingDownloads';
-import { addHistoryEntry, addPending, removePending } from '../lib/history';
+import { addPending } from '../lib/history';
 import { friendlyErrorHint } from '../lib/errorHints';
 
 // Maps a quality id to the short badge shown on the video preview thumbnail
@@ -24,6 +24,7 @@ export default function Home() {
   const [videoInfo, setVideoInfo] = useState(null); // { title, thumbnail, channel, duration }
   const [status, setStatus] = useState('idle'); // idle | checking | loading | error | done
   const [errorMsg, setErrorMsg] = useState('');
+  const [dl, setDl] = useState({ starting: false, active: false, percent: 0, message: '', error: '' });
 
   const backendUrl = (process.env.NEXT_PUBLIC_BACKEND_URL || '').replace(/\/+$/, '');
 
@@ -34,6 +35,7 @@ export default function Home() {
     setErrorMsg('');
     setQualities([]);
     setVideoInfo(null);
+    setDl({ starting: false, active: false, percent: 0, message: '', error: '' });
 
     try {
       const res = await fetch(`${backendUrl}/formats`, {
@@ -75,12 +77,10 @@ export default function Home() {
     }
   };
 
-  const [dl, setDl] = useState({ active: false, percent: 0, message: '', error: '' });
-
   const handleDownload = async () => {
-    if (!url.trim() || !selectedQuality || dl.active) return;
+    if (!url.trim() || !selectedQuality || dl.starting || dl.active) return;
 
-    setDl({ active: true, percent: 0, message: 'Starting…', error: '' });
+    setDl({ starting: true, active: false, percent: 0, message: '', error: '' });
 
     try {
       const res = await fetch(`${backendUrl}/download/start`, {
@@ -108,58 +108,27 @@ export default function Home() {
         badge: BADGE_BY_ID[selectedQuality] || '',
         container,
       });
+      // The shared <PendingDownloads /> list (rendered above) is what actually
+      // fetches the finished file, saves history, and handles cancellation.
+      // This connection is purely a read-only mirror so the progress bar can
+      // also show up right here next to the button — it never duplicates any
+      // of those side effects.
+      setDl({ starting: false, active: true, percent: 0, message: 'Starting…', error: '' });
 
       const es = new EventSource(`${backendUrl}/download/progress/${jobId}`);
-
       es.onmessage = (e) => {
         const data = JSON.parse(e.data);
-
         if (data.status === 'error') {
-          removePending(jobId);
-          setDl({ active: false, percent: 0, message: '', error: data.error || 'Download failed' });
+          setDl({ starting: false, active: false, percent: 0, message: '', error: data.error || 'Download failed' });
           es.close();
           return;
         }
-
-        setDl({ active: true, percent: data.percent, message: data.message, error: '' });
-
-        if (data.status === 'done') {
-          es.close();
-          removePending(jobId);
-
-          // The file's already fully merged at this point, so fetching it is
-          // fast — a hidden iframe lets the browser handle it as a normal
-          // streamed download without navigating away from this page.
-          const fileUrl = `${backendUrl}/download/file/${jobId}`;
-          const iframe = document.createElement('iframe');
-          iframe.style.display = 'none';
-          iframe.src = fileUrl;
-          document.body.appendChild(iframe);
-          setTimeout(() => iframe.remove(), 5 * 60 * 1000);
-
-          const qualityOption = qualities.find((q) => q.id === selectedQuality);
-          addHistoryEntry({
-            url,
-            title: videoInfo?.title || 'video',
-            thumbnail: videoInfo?.thumbnail || '',
-            channel: videoInfo?.channel || '',
-            duration: videoInfo?.duration || '',
-            qualityId: selectedQuality,
-            qualityLabel: qualityOption?.label || selectedQuality,
-            badge: BADGE_BY_ID[selectedQuality] || '',
-            container,
-          });
-
-          setDl({ active: false, percent: 100, message: 'Done', error: '' });
-        }
+        setDl({ starting: false, active: data.status !== 'done', percent: data.percent, message: data.message, error: '' });
+        if (data.status === 'done') es.close();
       };
-
-      es.onerror = () => {
-        // Connection hiccup — only treat as fatal if the job itself never resolved
-        es.close();
-      };
+      es.onerror = () => es.close();
     } catch (err) {
-      setDl({ active: false, percent: 0, message: '', error: err.message });
+      setDl({ starting: false, active: false, percent: 0, message: '', error: err.message });
     }
   };
 
@@ -295,11 +264,11 @@ export default function Home() {
                 <div className="flex-grow" />
                 <button
                   onClick={handleDownload}
-                  disabled={!selectedQuality || dl.active}
+                  disabled={!selectedQuality || dl.starting || dl.active}
                   className="w-full h-14 rounded-xl bg-primary text-on-primary font-button-text text-button-text text-lg hover:bg-surface-tint hover:shadow-lg transition-all flex items-center justify-center gap-2 active:scale-95 duration-100 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <span className="material-symbols-outlined">download</span>
-                  {dl.active ? 'Downloading…' : 'Download'}
+                  {dl.starting ? 'Starting…' : dl.active ? 'Downloading…' : 'Download'}
                 </button>
                 {dl.active && (
                   <div className="flex flex-col gap-1.5">
@@ -313,11 +282,6 @@ export default function Home() {
                       {dl.message} {dl.percent > 0 ? `(${Math.round(dl.percent)}%)` : ''}
                     </p>
                   </div>
-                )}
-                {!dl.active && dl.percent === 100 && !dl.error && (
-                  <p className="font-label-sm text-label-sm text-on-tertiary-container text-center">
-                    Done — check your browser's downloads.
-                  </p>
                 )}
                 {dl.error && (
                   <div>

@@ -3,13 +3,13 @@
 import { useEffect, useState } from 'react';
 import Header from '../../components/Header';
 import PendingDownloads from '../../components/PendingDownloads';
-import { getHistory, deleteHistoryEntry, clearHistory, addPending, removePending, formatBytes, formatDate } from '../../lib/history';
+import { getHistory, deleteHistoryEntry, clearHistory, addPending, formatBytes, formatDate } from '../../lib/history';
 import { friendlyErrorHint } from '../../lib/errorHints';
 
 export default function History() {
   const [entries, setEntries] = useState([]);
   const [errorMsg, setErrorMsg] = useState('');
-  const [progressByEntry, setProgressByEntry] = useState({}); // id -> { active, percent, message, error }
+  const [redownloadState, setRedownloadState] = useState({}); // id -> { starting, error }
 
   const backendUrl = (process.env.NEXT_PUBLIC_BACKEND_URL || '').replace(/\/+$/, '');
 
@@ -29,7 +29,7 @@ export default function History() {
 
   const handleRedownload = async (entry) => {
     setErrorMsg('');
-    setProgressByEntry((prev) => ({ ...prev, [entry.id]: { active: true, percent: 0, message: 'Starting…', error: '' } }));
+    setRedownloadState((prev) => ({ ...prev, [entry.id]: { starting: true, error: '' } }));
 
     try {
       const res = await fetch(`${backendUrl}/download/start`, {
@@ -54,37 +54,11 @@ export default function History() {
         badge: entry.badge,
         container: entry.container,
       });
-
-      const es = new EventSource(`${backendUrl}/download/progress/${jobId}`);
-
-      es.onmessage = (e) => {
-        const data = JSON.parse(e.data);
-
-        if (data.status === 'error') {
-          removePending(jobId);
-          setProgressByEntry((prev) => ({ ...prev, [entry.id]: { active: false, percent: 0, message: '', error: data.error || 'Download failed' } }));
-          es.close();
-          return;
-        }
-
-        setProgressByEntry((prev) => ({ ...prev, [entry.id]: { active: true, percent: data.percent, message: data.message, error: '' } }));
-
-        if (data.status === 'done') {
-          es.close();
-          removePending(jobId);
-          const fileUrl = `${backendUrl}/download/file/${jobId}`;
-          const iframe = document.createElement('iframe');
-          iframe.style.display = 'none';
-          iframe.src = fileUrl;
-          document.body.appendChild(iframe);
-          setTimeout(() => iframe.remove(), 5 * 60 * 1000);
-          setProgressByEntry((prev) => ({ ...prev, [entry.id]: { active: false, percent: 100, message: 'Done', error: '' } }));
-        }
-      };
-
-      es.onerror = () => es.close();
+      // Progress, completion, and cancellation are all handled by the shared
+      // <PendingDownloads /> list rendered above.
+      setRedownloadState((prev) => ({ ...prev, [entry.id]: { starting: false, error: '' } }));
     } catch (err) {
-      setProgressByEntry((prev) => ({ ...prev, [entry.id]: { active: false, percent: 0, message: '', error: err.message } }));
+      setRedownloadState((prev) => ({ ...prev, [entry.id]: { starting: false, error: err.message } }));
     }
   };
 
@@ -189,36 +163,22 @@ export default function History() {
                         </button>
                         <button
                           onClick={() => handleRedownload(entry)}
-                          disabled={progressByEntry[entry.id]?.active}
+                          disabled={redownloadState[entry.id]?.starting}
                           className="flex-1 sm:flex-none justify-center px-4 sm:px-5 py-2.5 bg-primary text-on-primary font-button-text rounded-lg hover:bg-on-background transition-colors flex items-center gap-2 disabled:opacity-50 whitespace-nowrap"
                         >
                           <span className="material-symbols-outlined text-[20px]">download</span>
                           <span className="truncate">
-                            {progressByEntry[entry.id]?.active ? 'Downloading…' : 'Download again'}
+                            {redownloadState[entry.id]?.starting ? 'Starting…' : 'Download again'}
                           </span>
                         </button>
                       </div>
-                      {progressByEntry[entry.id]?.active && (
-                        <div className="flex flex-col gap-1 w-full sm:w-48">
-                          <div className="w-full h-1.5 rounded-full bg-surface-container-high overflow-hidden">
-                            <div
-                              className="h-full bg-secondary transition-all duration-300"
-                              style={{ width: `${Math.max(2, progressByEntry[entry.id].percent)}%` }}
-                            />
-                          </div>
-                          <p className="font-label-sm text-[11px] text-on-surface-variant text-right">
-                            {progressByEntry[entry.id].message}{' '}
-                            {progressByEntry[entry.id].percent > 0 ? `(${Math.round(progressByEntry[entry.id].percent)}%)` : ''}
-                          </p>
-                        </div>
-                      )}
-                      {progressByEntry[entry.id]?.error && (
+                      {redownloadState[entry.id]?.error && (
                         <div className="text-right">
                           <p className="font-label-sm text-[11px] text-error">
-                            {progressByEntry[entry.id].error}
+                            {redownloadState[entry.id].error}
                           </p>
                           <p className="font-label-sm text-[11px] text-on-surface-variant mt-0.5">
-                            {friendlyErrorHint(progressByEntry[entry.id].error)}
+                            {friendlyErrorHint(redownloadState[entry.id].error)}
                           </p>
                         </div>
                       )}

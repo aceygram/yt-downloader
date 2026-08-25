@@ -52,6 +52,7 @@ export function formatDate(isoString) {
 // file available for 1 hour after completion, so there's a real window to
 // come back within.
 const PENDING_KEY = 'yt4ksave-pending';
+const PENDING_CHANGED_EVENT = 'yt4ksave-pending-changed';
 
 export function getPending() {
   if (typeof window === 'undefined') return [];
@@ -67,10 +68,18 @@ export function addPending(entry) {
   if (typeof window === 'undefined') return;
   const pending = getPending().filter((p) => p.jobId !== entry.jobId);
   window.localStorage.setItem(PENDING_KEY, JSON.stringify([{ startedAt: new Date().toISOString(), ...entry }, ...pending]));
+  window.dispatchEvent(new Event(PENDING_CHANGED_EVENT));
 }
 
 export function removePending(jobId) {
   if (typeof window === 'undefined') return;
   const pending = getPending().filter((p) => p.jobId !== jobId);
   window.localStorage.setItem(PENDING_KEY, JSON.stringify(pending));
+  window.dispatchEvent(new Event(PENDING_CHANGED_EVENT));
+}
+
+export function onPendingChanged(callback) {
+  if (typeof window === 'undefined') return () => {};
+  window.addEventListener(PENDING_CHANGED_EVENT, callback);
+  return () => window.removeEventListener(PENDING_CHANGED_EVENT, callback);
 }

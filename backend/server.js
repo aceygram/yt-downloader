@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const { spawn } = require('child_process');
+const { spawn, exec } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -31,7 +31,33 @@ function isTransientReloadError(stderrText) {
 // unescaped (Node's own deprecation warning), which is a real injection risk here
 // since args include a user-supplied URL.
 function spawnYtDlp(args) {
-  return spawn('yt-dlp', args);
+  // detached:true (POSIX only) puts yt-dlp in its own process group, so cancelling
+  // can kill it AND any ffmpeg process it spawned internally, not just yt-dlp itself.
+  const options = process.platform === 'win32' ? {} : { detached: true };
+  return spawn('yt-dlp', args, options);
+}
+
+// Kills a yt-dlp job's whole process tree (it may have spawned ffmpeg as a child),
+// not just the top-level process — otherwise a cancelled job could leave ffmpeg
+// running in the background, still eating CPU/bandwidth.
+function killProcessTree(child) {
+  if (!child || child.killed || !child.pid) return;
+  if (process.platform === 'win32') {
+    exec(`taskkill /PID ${child.pid} /T /F`, (err) => {
+      if (err) console.error('Failed to kill process tree (Windows):', err.message);
+    });
+  } else {
+    try {
+      process.kill(-child.pid, 'SIGTERM'); // negative pid = whole process group
+    } catch (err) {
+      console.error('Failed to kill process group, falling back to single process:', err.message);
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // process may have already exited
+      }
+    }
+  }
 }
 
 // With cookies present, yt-dlp's automatic client selection leans toward the
@@ -116,6 +142,8 @@ function createJob() {
     error: null,
     createdAt: Date.now(),
     completedAt: null, // set once status becomes done or error
+    cancelled: false,
+    process: null, // the current yt-dlp child process, so it can be killed on cancel
   };
   jobs.set(id, job);
   return job;
@@ -259,6 +287,7 @@ app.get('/download/progress/:jobId', (req, res) => {
       percent: job.percent,
       message: job.message,
       error: job.error,
+      sizeBytes: job.sizeBytes || null,
     })}\n\n`);
   };
 
@@ -295,6 +324,21 @@ app.get('/download/file/:jobId', (req, res) => {
   };
   readStream.on('close', cleanup);
   readStream.on('error', cleanup);
+});
+
+// STEP B4: cancel an in-progress job — kills the actual yt-dlp/ffmpeg process,
+// not just the frontend's tracking of it, so cancelling really stops the work.
+app.delete('/download/job/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  job.cancelled = true;
+  if (job.process) killProcessTree(job.process);
+  if (job.tempDir) cleanupTempDir(job.tempDir);
+  updateJob(job, { status: 'error', error: 'Cancelled' });
+  jobs.delete(job.id);
+
+  res.json({ cancelled: true });
 });
 
 // Parses yt-dlp's own progress lines to drive the job's percent/message.
@@ -349,6 +393,7 @@ function runDownloadJob(job, formatSelector, url, container, isFallback, retryCo
   ];
 
   const ytdlp = spawnYtDlp(args);
+  updateJob(job, { process: ytdlp });
   let stderrBuffer = '';
   let stdoutTail = '';
 
@@ -371,15 +416,25 @@ function runDownloadJob(job, formatSelector, url, container, isFallback, retryCo
   });
 
   ytdlp.on('close', async (code) => {
+    if (job.cancelled) return; // already handled by the cancel endpoint
+
     const files = fs.existsSync(tempDir) ? fs.readdirSync(tempDir) : [];
     const finishedFile = files.find((f) => f.startsWith('video.'));
 
     if (code === 0 && finishedFile) {
+      const filePath = path.join(tempDir, finishedFile);
+      let sizeBytes = null;
+      try {
+        sizeBytes = fs.statSync(filePath).size;
+      } catch {
+        // non-fatal — history just won't show a size for this one
+      }
       updateJob(job, {
         status: 'done',
         percent: 100,
         message: 'Done',
-        filePath: path.join(tempDir, finishedFile),
+        filePath,
+        sizeBytes,
       });
       return;
     }
@@ -391,6 +446,7 @@ function runDownloadJob(job, formatSelector, url, container, isFallback, retryCo
       console.warn(`Transient reload error, retrying same quality (attempt ${retryCount + 2}/${maxRetries + 1})...`);
       updateJob(job, { status: 'retrying', message: 'Retrying…', percent: 0, _destinationCount: 0 });
       await sleep(1000 * (retryCount + 1));
+      if (job.cancelled) return;
       return runDownloadJob(job, formatSelector, url, container, isFallback, retryCount + 1);
     }
 
@@ -423,6 +479,7 @@ function runDownloadJobFallback(job, url) {
   ];
 
   const ytdlp = spawnYtDlp(args);
+  updateJob(job, { process: ytdlp });
   let stdoutTail = '';
 
   ytdlp.stdout.on('data', (d) => {
@@ -433,15 +490,25 @@ function runDownloadJobFallback(job, url) {
   });
 
   ytdlp.on('close', (code) => {
+    if (job.cancelled) return; // already handled by the cancel endpoint
+
     const files = fs.existsSync(tempDir) ? fs.readdirSync(tempDir) : [];
     const finishedFile = files.find((f) => f.startsWith('video.'));
 
     if (code === 0 && finishedFile) {
+      const filePath = path.join(tempDir, finishedFile);
+      let sizeBytes = null;
+      try {
+        sizeBytes = fs.statSync(filePath).size;
+      } catch {
+        // non-fatal — history just won't show a size for this one
+      }
       updateJob(job, {
         status: 'done',
         percent: 100,
         message: 'Done',
-        filePath: path.join(tempDir, finishedFile),
+        filePath,
+        sizeBytes,
       });
     } else {
       cleanupTempDir(tempDir);

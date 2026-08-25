@@ -1,72 +1,110 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { getPending, removePending, addHistoryEntry } from '../lib/history';
+import { useEffect, useRef, useState } from 'react';
+import { getPending, removePending, addHistoryEntry, onPendingChanged } from '../lib/history';
 import { friendlyErrorHint } from '../lib/errorHints';
 
-// Renders any downloads that were still in progress when this tab was last
-// closed/reloaded, reconnects to their SSE progress stream, and finishes them
-// into history once done — this is what makes "close the tab, come back
-// later" actually work, instead of losing track of an in-progress job.
+// Renders every currently-tracked download (freshly started or resumed after
+// reopening the tab), reconnects to each one's SSE progress stream, lets the
+// user cancel any of them, and finishes them into history once done. This is
+// the single place any in-progress download lives and can be stopped.
 export default function PendingDownloads({ onSettled }) {
   const [items, setItems] = useState([]);
   const [progress, setProgress] = useState({}); // jobId -> { percent, message, error }
+  const sourcesRef = useRef({}); // jobId -> EventSource, so we can close ones that disappear
 
   const backendUrl = (process.env.NEXT_PUBLIC_BACKEND_URL || '').replace(/\/+$/, '');
 
-  useEffect(() => {
+  const trackJob = (entry) => {
+    if (sourcesRef.current[entry.jobId]) return; // already tracking this one
+    const es = new EventSource(`${backendUrl}/download/progress/${entry.jobId}`);
+    sourcesRef.current[entry.jobId] = es;
+
+    es.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+
+      if (data.status === 'error') {
+        setProgress((prev) => ({ ...prev, [entry.jobId]: { percent: 0, message: '', error: data.error || 'Download failed' } }));
+        removePending(entry.jobId);
+        es.close();
+        delete sourcesRef.current[entry.jobId];
+        return;
+      }
+
+      setProgress((prev) => ({ ...prev, [entry.jobId]: { percent: data.percent, message: data.message, error: '' } }));
+
+      if (data.status === 'done') {
+        es.close();
+        delete sourcesRef.current[entry.jobId];
+
+        const fileUrl = `${backendUrl}/download/file/${entry.jobId}`;
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        iframe.src = fileUrl;
+        document.body.appendChild(iframe);
+        setTimeout(() => iframe.remove(), 5 * 60 * 1000);
+
+        addHistoryEntry({
+          url: entry.url,
+          title: entry.title,
+          thumbnail: entry.thumbnail,
+          channel: entry.channel,
+          duration: entry.duration,
+          qualityId: entry.qualityId,
+          qualityLabel: entry.qualityLabel,
+          badge: entry.badge,
+          container: entry.container,
+          sizeBytes: data.sizeBytes || null,
+        });
+        removePending(entry.jobId);
+        if (onSettled) onSettled();
+      }
+    };
+
+    es.onerror = () => {
+      es.close();
+      delete sourcesRef.current[entry.jobId];
+    };
+  };
+
+  const syncFromStorage = () => {
     const pending = getPending();
     setItems(pending);
+    pending.forEach(trackJob);
 
-    const sources = pending.map((entry) => {
-      const es = new EventSource(`${backendUrl}/download/progress/${entry.jobId}`);
-
-      es.onmessage = (e) => {
-        const data = JSON.parse(e.data);
-
-        if (data.status === 'error') {
-          setProgress((prev) => ({ ...prev, [entry.jobId]: { percent: 0, message: '', error: data.error || 'Download failed' } }));
-          removePending(entry.jobId);
-          es.close();
-          return;
-        }
-
-        setProgress((prev) => ({ ...prev, [entry.jobId]: { percent: data.percent, message: data.message, error: '' } }));
-
-        if (data.status === 'done') {
-          es.close();
-
-          const fileUrl = `${backendUrl}/download/file/${entry.jobId}`;
-          const iframe = document.createElement('iframe');
-          iframe.style.display = 'none';
-          iframe.src = fileUrl;
-          document.body.appendChild(iframe);
-          setTimeout(() => iframe.remove(), 5 * 60 * 1000);
-
-          addHistoryEntry({
-            url: entry.url,
-            title: entry.title,
-            thumbnail: entry.thumbnail,
-            channel: entry.channel,
-            duration: entry.duration,
-            qualityId: entry.qualityId,
-            qualityLabel: entry.qualityLabel,
-            badge: entry.badge,
-            container: entry.container,
-          });
-          removePending(entry.jobId);
-          setItems((prev) => prev.filter((p) => p.jobId !== entry.jobId));
-          if (onSettled) onSettled();
-        }
-      };
-
-      es.onerror = () => es.close();
-      return es;
+    // Stop tracking (and drop progress for) anything no longer in the pending list
+    const currentIds = new Set(pending.map((p) => p.jobId));
+    Object.keys(sourcesRef.current).forEach((jobId) => {
+      if (!currentIds.has(jobId)) {
+        sourcesRef.current[jobId].close();
+        delete sourcesRef.current[jobId];
+      }
     });
+  };
 
-    return () => sources.forEach((es) => es.close());
+  useEffect(() => {
+    syncFromStorage();
+    const unsubscribe = onPendingChanged(syncFromStorage);
+    return () => {
+      unsubscribe();
+      Object.values(sourcesRef.current).forEach((es) => es.close());
+      sourcesRef.current = {};
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const handleCancel = async (jobId) => {
+    try {
+      await fetch(`${backendUrl}/download/job/${jobId}`, { method: 'DELETE' });
+    } catch {
+      // best-effort — remove locally regardless, since the job may already be gone
+    }
+    if (sourcesRef.current[jobId]) {
+      sourcesRef.current[jobId].close();
+      delete sourcesRef.current[jobId];
+    }
+    removePending(jobId);
+  };
 
   if (items.length === 0) return null;
 
@@ -109,6 +147,13 @@ export default function PendingDownloads({ onSettled }) {
                 </>
               )}
             </div>
+            <button
+              onClick={() => handleCancel(entry.jobId)}
+              aria-label="Cancel download"
+              className="shrink-0 p-2 text-on-surface-variant hover:text-error transition-colors bg-surface-container-low rounded-lg hover:bg-error-container flex items-center justify-center"
+            >
+              <span className="material-symbols-outlined text-[20px]">close</span>
+            </button>
           </div>
         );
       })}
