@@ -29,7 +29,7 @@ export default function History() {
 
   const handleRedownload = async (entry) => {
     setErrorMsg('');
-    setRedownloadState((prev) => ({ ...prev, [entry.id]: { starting: true, error: '' } }));
+    setRedownloadState((prev) => ({ ...prev, [entry.id]: { starting: true, active: false, ready: false, percent: 0, message: '', error: '' } }));
 
     try {
       const res = await fetch(`${backendUrl}/download/start`, {
@@ -54,11 +54,30 @@ export default function History() {
         badge: entry.badge,
         container: entry.container,
       });
-      // Progress, completion, and cancellation are all handled by the shared
-      // <PendingDownloads /> list rendered above.
-      setRedownloadState((prev) => ({ ...prev, [entry.id]: { starting: false, error: '' } }));
+      // The shared <PendingDownloads /> list above is what actually asks to
+      // confirm-and-save the finished file and handles history/cancellation.
+      // This connection is just a read-only mirror so progress also shows
+      // right next to this button.
+      setRedownloadState((prev) => ({ ...prev, [entry.id]: { starting: false, active: true, ready: false, percent: 0, message: 'Starting…', error: '' } }));
+
+      const es = new EventSource(`${backendUrl}/download/progress/${jobId}`);
+      es.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        if (data.status === 'error') {
+          setRedownloadState((prev) => ({ ...prev, [entry.id]: { starting: false, active: false, ready: false, percent: 0, message: '', error: data.error || 'Download failed' } }));
+          es.close();
+          return;
+        }
+        if (data.status === 'done') {
+          es.close();
+          setRedownloadState((prev) => ({ ...prev, [entry.id]: { starting: false, active: false, ready: true, percent: 100, message: 'Ready', error: '', sizeBytes: data.sizeBytes || null } }));
+          return;
+        }
+        setRedownloadState((prev) => ({ ...prev, [entry.id]: { starting: false, active: true, ready: false, percent: data.percent, message: data.message, error: '' } }));
+      };
+      es.onerror = () => es.close();
     } catch (err) {
-      setRedownloadState((prev) => ({ ...prev, [entry.id]: { starting: false, error: err.message } }));
+      setRedownloadState((prev) => ({ ...prev, [entry.id]: { starting: false, active: false, ready: false, percent: 0, message: '', error: err.message } }));
     }
   };
 
@@ -163,15 +182,41 @@ export default function History() {
                         </button>
                         <button
                           onClick={() => handleRedownload(entry)}
-                          disabled={redownloadState[entry.id]?.starting}
+                          disabled={redownloadState[entry.id]?.starting || redownloadState[entry.id]?.active || redownloadState[entry.id]?.ready}
                           className="flex-1 sm:flex-none justify-center px-4 sm:px-5 py-2.5 bg-primary text-on-primary font-button-text rounded-lg hover:bg-on-background transition-colors flex items-center gap-2 disabled:opacity-50 whitespace-nowrap"
                         >
                           <span className="material-symbols-outlined text-[20px]">download</span>
                           <span className="truncate">
-                            {redownloadState[entry.id]?.starting ? 'Starting…' : 'Download again'}
+                            {redownloadState[entry.id]?.starting
+                              ? 'Starting…'
+                              : redownloadState[entry.id]?.active
+                              ? 'Downloading…'
+                              : redownloadState[entry.id]?.ready
+                              ? 'Ready above ↑'
+                              : 'Download again'}
                           </span>
                         </button>
                       </div>
+                      {redownloadState[entry.id]?.active && (
+                        <div className="flex flex-col gap-1 w-full sm:w-48">
+                          <div className="w-full h-1.5 rounded-full bg-surface-container-high overflow-hidden">
+                            <div
+                              className="h-full bg-secondary transition-all duration-300"
+                              style={{ width: `${Math.max(2, redownloadState[entry.id].percent)}%` }}
+                            />
+                          </div>
+                          <p className="font-label-sm text-[11px] text-on-surface-variant text-right">
+                            {redownloadState[entry.id].message}{' '}
+                            {redownloadState[entry.id].percent > 0 ? `(${Math.round(redownloadState[entry.id].percent)}%)` : ''}
+                          </p>
+                        </div>
+                      )}
+                      {redownloadState[entry.id]?.ready && (
+                        <p className="font-label-sm text-[11px] text-on-tertiary-container text-right">
+                          {redownloadState[entry.id].sizeBytes ? formatBytes(redownloadState[entry.id].sizeBytes) : 'Size unknown'}{' '}
+                          — confirm in Downloads above
+                        </p>
+                      )}
                       {redownloadState[entry.id]?.error && (
                         <div className="text-right">
                           <p className="font-label-sm text-[11px] text-error">

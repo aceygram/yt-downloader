@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { getPending, removePending, addHistoryEntry, onPendingChanged } from '../lib/history';
+import { getPending, removePending, addHistoryEntry, formatBytes, onPendingChanged } from '../lib/history';
 import { friendlyErrorHint } from '../lib/errorHints';
 
 // Renders every currently-tracked download (freshly started or resumed after
@@ -10,7 +10,7 @@ import { friendlyErrorHint } from '../lib/errorHints';
 // the single place any in-progress download lives and can be stopped.
 export default function PendingDownloads({ onSettled }) {
   const [items, setItems] = useState([]);
-  const [progress, setProgress] = useState({}); // jobId -> { percent, message, error }
+  const [progress, setProgress] = useState({}); // jobId -> { percent, message, error, ready, sizeBytes }
   const sourcesRef = useRef({}); // jobId -> EventSource, so we can close ones that disappear
 
   const backendUrl = (process.env.NEXT_PUBLIC_BACKEND_URL || '').replace(/\/+$/, '');
@@ -31,34 +31,20 @@ export default function PendingDownloads({ onSettled }) {
         return;
       }
 
-      setProgress((prev) => ({ ...prev, [entry.jobId]: { percent: data.percent, message: data.message, error: '' } }));
-
       if (data.status === 'done') {
         es.close();
         delete sourcesRef.current[entry.jobId];
-
-        const fileUrl = `${backendUrl}/download/file/${entry.jobId}`;
-        const iframe = document.createElement('iframe');
-        iframe.style.display = 'none';
-        iframe.src = fileUrl;
-        document.body.appendChild(iframe);
-        setTimeout(() => iframe.remove(), 5 * 60 * 1000);
-
-        addHistoryEntry({
-          url: entry.url,
-          title: entry.title,
-          thumbnail: entry.thumbnail,
-          channel: entry.channel,
-          duration: entry.duration,
-          qualityId: entry.qualityId,
-          qualityLabel: entry.qualityLabel,
-          badge: entry.badge,
-          container: entry.container,
-          sizeBytes: data.sizeBytes || null,
-        });
-        removePending(entry.jobId);
-        if (onSettled) onSettled();
+        // Merging is finished and the real file size is now known — pause here
+        // and let the user confirm the actual save, instead of guessing a size
+        // upfront or auto-saving the moment it's ready.
+        setProgress((prev) => ({
+          ...prev,
+          [entry.jobId]: { percent: 100, message: 'Ready', error: '', ready: true, sizeBytes: data.sizeBytes || null },
+        }));
+        return;
       }
+
+      setProgress((prev) => ({ ...prev, [entry.jobId]: { percent: data.percent, message: data.message, error: '', ready: false } }));
     };
 
     es.onerror = () => {
@@ -106,15 +92,46 @@ export default function PendingDownloads({ onSettled }) {
     removePending(jobId);
   };
 
+  // User confirmed they want the finished file — this is the only place that
+  // actually triggers the browser save and writes a history entry.
+  const handleSave = (entry) => {
+    const p = progress[entry.jobId];
+    const fileUrl = `${backendUrl}/download/file/${entry.jobId}`;
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = fileUrl;
+    document.body.appendChild(iframe);
+    // This is just DOM cleanup, not a download time limit — removing the iframe
+    // aborts its in-flight request, so it must comfortably outlast any realistic
+    // download duration. A large 4K file over a home connection can take well
+    // over an hour; 5 minutes here was silently truncating those downloads.
+    setTimeout(() => iframe.remove(), 3 * 60 * 60 * 1000); // 3 hours
+
+    addHistoryEntry({
+      url: entry.url,
+      title: entry.title,
+      thumbnail: entry.thumbnail,
+      channel: entry.channel,
+      duration: entry.duration,
+      qualityId: entry.qualityId,
+      qualityLabel: entry.qualityLabel,
+      badge: entry.badge,
+      container: entry.container,
+      sizeBytes: p?.sizeBytes || null,
+    });
+    removePending(entry.jobId);
+    if (onSettled) onSettled();
+  };
+
   if (items.length === 0) return null;
 
   return (
     <section className="flex flex-col gap-3">
       <h2 className="font-label-sm text-label-sm text-on-surface-variant font-bold uppercase tracking-wide">
-        Downloads in progress
+        Downloads
       </h2>
       {items.map((entry) => {
-        const p = progress[entry.jobId] || { percent: 0, message: 'Resuming…', error: '' };
+        const p = progress[entry.jobId] || { percent: 0, message: 'Resuming…', error: '', ready: false };
         return (
           <div
             key={entry.jobId}
@@ -133,6 +150,19 @@ export default function PendingDownloads({ onSettled }) {
                   <p className="font-label-sm text-label-sm text-error mt-1">{p.error}</p>
                   <p className="font-label-sm text-[11px] text-on-surface-variant mt-0.5">{friendlyErrorHint(p.error)}</p>
                 </>
+              ) : p.ready ? (
+                <div className="flex flex-wrap items-center justify-between gap-2 mt-1.5">
+                  <p className="font-label-sm text-[12px] text-on-tertiary-container">
+                    Ready — {p.sizeBytes ? formatBytes(p.sizeBytes) : 'size unknown'}
+                  </p>
+                  <button
+                    onClick={() => handleSave(entry)}
+                    className="px-3 py-1.5 bg-primary text-on-primary rounded-lg text-xs font-button-text flex items-center gap-1"
+                  >
+                    <span className="material-symbols-outlined text-[16px]">download</span>
+                    Download
+                  </button>
+                </div>
               ) : (
                 <>
                   <div className="w-full h-1.5 rounded-full bg-surface-container-high overflow-hidden mt-1.5">
@@ -149,10 +179,10 @@ export default function PendingDownloads({ onSettled }) {
             </div>
             <button
               onClick={() => handleCancel(entry.jobId)}
-              aria-label="Cancel download"
+              aria-label={p.ready ? 'Discard without saving' : 'Cancel download'}
               className="shrink-0 p-2 text-on-surface-variant hover:text-error transition-colors bg-surface-container-low rounded-lg hover:bg-error-container flex items-center justify-center"
             >
-              <span className="material-symbols-outlined text-[20px]">close</span>
+              <span className="material-symbols-outlined text-[20px]">{p.ready ? 'delete' : 'close'}</span>
             </button>
           </div>
         );

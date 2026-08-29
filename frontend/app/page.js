@@ -109,10 +109,9 @@ export default function Home() {
         container,
       });
       // The shared <PendingDownloads /> list (rendered above) is what actually
-      // fetches the finished file, saves history, and handles cancellation.
-      // This connection is purely a read-only mirror so the progress bar can
-      // also show up right here next to the button — it never duplicates any
-      // of those side effects.
+      // asks to confirm-and-save the finished file (with its real size) and
+      // handles history/cancellation. This connection is purely a read-only
+      // mirror so progress also shows up right here next to the button.
       setDl({ starting: false, active: true, percent: 0, message: 'Starting…', error: '' });
 
       const es = new EventSource(`${backendUrl}/download/progress/${jobId}`);

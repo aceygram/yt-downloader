@@ -102,6 +102,34 @@ function effectiveHeight(f) {
   return Math.max(f.height || 0, widthDerived);
 }
 
+// Estimates total download size (video + audio combined) for a quality option,
+// using yt-dlp's own reported filesize (exact) or filesize_approx (estimated).
+// Returns null if either component's size is unknown — better to show nothing
+// than a misleadingly partial number.
+function estimateSizeBytes(formats, opt) {
+  const sizeOf = (f) => f.filesize || f.filesize_approx || null;
+
+  // Video: the best match at/under this tier's height, in the required container —
+  // mirrors the same [ext=X][height<=H] logic the actual download selector uses.
+  const videoCandidates = formats.filter(
+    (f) => f.vcodec && f.vcodec !== 'none' && f.ext === opt.container && effectiveHeight(f) <= opt.height
+  );
+  const videoFormat = videoCandidates.sort((a, b) => effectiveHeight(b) - effectiveHeight(a))[0];
+
+  // Audio: matches the extension the download selector actually requests
+  // (m4a alongside mp4, webm alongside webm)
+  const audioExt = opt.container === 'webm' ? 'webm' : 'm4a';
+  const audioCandidates = formats.filter(
+    (f) => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none') && f.ext === audioExt
+  );
+  const audioFormat = audioCandidates.sort((a, b) => (sizeOf(b) || 0) - (sizeOf(a) || 0))[0];
+
+  const videoSize = videoFormat ? sizeOf(videoFormat) : null;
+  const audioSize = audioFormat ? sizeOf(audioFormat) : null;
+  if (videoSize == null || audioSize == null) return null;
+  return videoSize + audioSize;
+}
+
 // Formats a duration in seconds as "m:ss" or "h:mm:ss" for display in the UI
 function formatDuration(seconds) {
   if (!seconds && seconds !== 0) return '';
@@ -198,7 +226,7 @@ app.post('/formats', async (req, res) => {
         info.formats.some(
           (f) => f.height && f.ext === opt.container && effectiveHeight(f) >= opt.height
         )
-      ).map((opt) => ({ id: opt.id, label: opt.label }));
+      ).map((opt) => ({ id: opt.id, label: opt.label, sizeBytes: estimateSizeBytes(info.formats, opt) }));
 
       return res.json({
         title: info.title,
