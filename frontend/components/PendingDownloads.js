@@ -151,18 +151,9 @@ export default function PendingDownloads({ onSettled }) {
                   <p className="font-label-sm text-[11px] text-on-surface-variant mt-0.5">{friendlyErrorHint(p.error)}</p>
                 </>
               ) : p.ready ? (
-                <div className="flex flex-wrap items-center justify-between gap-2 mt-1.5">
-                  <p className="font-label-sm text-[12px] text-on-tertiary-container">
-                    Ready — {p.sizeBytes ? formatBytes(p.sizeBytes) : 'size unknown'}
-                  </p>
-                  <button
-                    onClick={() => handleSave(entry)}
-                    className="px-3 py-1.5 bg-primary text-on-primary rounded-lg text-xs font-button-text flex items-center gap-1"
-                  >
-                    <span className="material-symbols-outlined text-[16px]">download</span>
-                    Download
-                  </button>
-                </div>
+                <p className="font-label-sm text-[12px] text-on-tertiary-container mt-1.5">
+                  Ready — {p.sizeBytes ? formatBytes(p.sizeBytes) : 'size unknown'}
+                </p>
               ) : (
                 <>
                   <div className="w-full h-1.5 rounded-full bg-surface-container-high overflow-hidden mt-1.5">
@@ -177,13 +168,24 @@ export default function PendingDownloads({ onSettled }) {
                 </>
               )}
             </div>
-            <button
-              onClick={() => handleCancel(entry.jobId)}
-              aria-label={p.ready ? 'Discard without saving' : 'Cancel download'}
-              className="shrink-0 p-2 text-on-surface-variant hover:text-error transition-colors bg-surface-container-low rounded-lg hover:bg-error-container flex items-center justify-center"
-            >
-              <span className="material-symbols-outlined text-[20px]">{p.ready ? 'delete' : 'close'}</span>
-            </button>
+            <div className="shrink-0 flex items-center gap-2">
+              {p.ready && (
+                <button
+                  onClick={() => handleSave(entry)}
+                  className="h-10 px-4 bg-primary text-on-primary rounded-lg text-xs font-button-text flex items-center gap-1.5 hover:bg-surface-tint transition-colors"
+                >
+                  <span className="material-symbols-outlined text-[18px]">download</span>
+                  Download
+                </button>
+              )}
+              <button
+                onClick={() => handleCancel(entry.jobId)}
+                aria-label={p.ready ? 'Discard without saving' : 'Cancel download'}
+                className="h-10 w-10 text-on-surface-variant hover:text-error transition-colors bg-surface-container-low rounded-lg hover:bg-error-container flex items-center justify-center"
+              >
+                <span className="material-symbols-outlined text-[20px]">{p.ready ? 'delete' : 'close'}</span>
+              </button>
+            </div>
           </div>
         );
       })}

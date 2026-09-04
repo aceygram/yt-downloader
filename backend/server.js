@@ -172,6 +172,8 @@ function createJob() {
     completedAt: null, // set once status becomes done or error
     cancelled: false,
     process: null, // the current yt-dlp child process, so it can be killed on cancel
+    slotAcquired: false, // whether this job currently occupies a concurrency slot
+    slotReleased: false, // guards against double-releasing (cancel + close both firing)
   };
   jobs.set(id, job);
   return job;
@@ -181,6 +183,49 @@ function updateJob(job, patch) {
   Object.assign(job, patch);
   if ((patch.status === 'done' || patch.status === 'error') && !job.completedAt) {
     job.completedAt = Date.now();
+  }
+}
+
+// Only a couple of yt-dlp+ffmpeg processes at once — a small Railway container
+// doesn't have the CPU/RAM to handle many concurrent 4K merges, and more than
+// a couple in parallel just makes all of them slower anyway. Anything beyond
+// the limit waits in line and starts automatically once a slot frees up,
+// rather than being rejected outright.
+const MAX_CONCURRENT_DOWNLOADS = 2;
+let activeDownloadCount = 0;
+const downloadQueue = []; // { job, run } — run() actually kicks off the yt-dlp job
+
+// Call when a job starts (or is picked up from the queue) to claim a slot.
+// If none are free, the job is queued and `run` is called later instead.
+function acquireSlotOrQueue(job, run) {
+  if (activeDownloadCount < MAX_CONCURRENT_DOWNLOADS) {
+    activeDownloadCount++;
+    job.slotAcquired = true;
+    run();
+  } else {
+    updateJob(job, { status: 'queued', message: 'Waiting for another download to finish…' });
+    downloadQueue.push({ job, run });
+  }
+}
+
+// Call exactly once when a job reaches a terminal state (done, error, or
+// cancelled) — frees its slot (if it had one) and starts the next queued job.
+function releaseJobSlot(job) {
+  if (job.slotReleased) return;
+  job.slotReleased = true;
+
+  // Remove it from the queue too, in case it was cancelled before ever starting
+  const queueIndex = downloadQueue.findIndex((q) => q.job.id === job.id);
+  if (queueIndex !== -1) downloadQueue.splice(queueIndex, 1);
+
+  if (!job.slotAcquired) return; // was only queued, never actually occupied a slot
+
+  activeDownloadCount = Math.max(0, activeDownloadCount - 1);
+  const next = downloadQueue.shift();
+  if (next) {
+    activeDownloadCount++;
+    next.job.slotAcquired = true;
+    next.run();
   }
 }
 
@@ -296,7 +341,7 @@ app.post('/download/start', (req, res) => {
   updateJob(job, { container, filenameBase });
   res.json({ jobId: job.id });
 
-  runDownloadJob(job, formatSelector, url, container, false, 0);
+  acquireSlotOrQueue(job, () => runDownloadJob(job, formatSelector, url, container, false, 0));
 });
 
 // STEP B2: live progress via Server-Sent Events — the frontend's actual progress bar
@@ -333,18 +378,51 @@ app.get('/download/progress/:jobId', (req, res) => {
 
 // STEP B3: once a job is done, this serves the actual finished file — fast,
 // since the merge already happened; the browser handles this as a normal
-// streamed download.
+// streamed download. Supports HTTP Range requests so that if the connection
+// gets cut mid-transfer (e.g. Railway's max request timeout, which applies
+// per-request regardless of file size — there's no body-size limit, just a
+// duration one), the browser can automatically resume from where it left off
+// instead of the file just being truncated.
 app.get('/download/file/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job || job.status !== 'done' || !job.filePath || !fs.existsSync(job.filePath)) {
     return res.status(404).json({ error: 'File not ready or job not found' });
   }
 
-  const ext = path.extname(job.filePath);
-  res.setHeader('Content-Disposition', `attachment; filename="${job.filenameBase}${ext}"`);
-  res.setHeader('Content-Type', job.container === 'webm' ? 'video/webm' : 'video/mp4');
+  const filePath = job.filePath;
+  const fileSize = fs.statSync(filePath).size;
+  const ext = path.extname(filePath);
+  const contentType = job.container === 'webm' ? 'video/webm' : 'video/mp4';
 
-  const readStream = fs.createReadStream(job.filePath);
+  res.setHeader('Accept-Ranges', 'bytes'); // tells the browser resuming is supported
+  res.setHeader('Content-Disposition', `attachment; filename="${job.filenameBase}${ext}"`);
+  res.setHeader('Content-Type', contentType);
+
+  const range = req.headers.range;
+
+  if (range) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+    const start = match && match[1] ? parseInt(match[1], 10) : 0;
+    const end = match && match[2] ? parseInt(match[2], 10) : fileSize - 1;
+
+    if (!match || Number.isNaN(start) || Number.isNaN(end) || start > end || end >= fileSize) {
+      res.setHeader('Content-Range', `bytes */${fileSize}`);
+      return res.status(416).end();
+    }
+
+    res.status(206);
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+    res.setHeader('Content-Length', end - start + 1);
+    fs.createReadStream(filePath, { start, end }).pipe(res);
+    // No cleanup here — a resumed download means more range requests are
+    // likely still coming for the rest of the file. The periodic sweep
+    // (1 hour after job completion) cleans up temp files either way, so
+    // nothing is left behind long-term even if the browser never finishes.
+    return;
+  }
+
+  res.setHeader('Content-Length', fileSize);
+  const readStream = fs.createReadStream(filePath);
   readStream.pipe(res);
   const cleanup = () => {
     cleanupTempDir(job.tempDir);
@@ -364,6 +442,7 @@ app.delete('/download/job/:jobId', (req, res) => {
   if (job.process) killProcessTree(job.process);
   if (job.tempDir) cleanupTempDir(job.tempDir);
   updateJob(job, { status: 'error', error: 'Cancelled' });
+  releaseJobSlot(job);
   jobs.delete(job.id);
 
   res.json({ cancelled: true });
@@ -429,6 +508,7 @@ function runDownloadJob(job, formatSelector, url, container, isFallback, retryCo
     console.error('Failed to launch yt-dlp:', err);
     cleanupTempDir(tempDir);
     updateJob(job, { status: 'error', error: 'yt-dlp is not available on the server' });
+    releaseJobSlot(job);
   });
 
   ytdlp.stdout.on('data', (d) => {
@@ -464,6 +544,7 @@ function runDownloadJob(job, formatSelector, url, container, isFallback, retryCo
         filePath,
         sizeBytes,
       });
+      releaseJobSlot(job);
       return;
     }
 
@@ -485,6 +566,7 @@ function runDownloadJob(job, formatSelector, url, container, isFallback, retryCo
     }
 
     updateJob(job, { status: 'error', error: stderrBuffer.slice(-300) || 'Download failed' });
+    releaseJobSlot(job);
   });
 }
 
@@ -542,6 +624,7 @@ function runDownloadJobFallback(job, url) {
       cleanupTempDir(tempDir);
       updateJob(job, { status: 'error', error: 'Download failed after retry' });
     }
+    releaseJobSlot(job);
   });
 }
 

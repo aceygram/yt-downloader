@@ -261,6 +261,27 @@ export default function Home() {
                   </div>
                 </div>
                 <div className="flex-grow" />
+                {dl.active && (
+                  <div className="flex flex-col gap-1.5">   
+                    <p className="font-label-sm text-label-sm text-on-surface-variant text-center">
+                      {dl.message} {dl.percent > 0 ? `(${Math.round(dl.percent)}%)` : ''}
+                    </p>
+                    <div className="w-full h-2 rounded-full bg-surface-container-high overflow-hidden">
+                      <div
+                        className="h-full bg-secondary transition-all duration-300"
+                        style={{ width: `${Math.max(2, dl.percent)}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+                {dl.error && (
+                  <div>
+                    <p className="font-label-sm text-label-sm text-on-surface-variant text-center mt-1">
+                      {friendlyErrorHint(dl.error)}
+                    </p>
+                    <p className="font-label-sm text-label-sm text-error text-center">{dl.error}</p>
+                  </div>
+                )}
                 <button
                   onClick={handleDownload}
                   disabled={!selectedQuality || dl.starting || dl.active}
@@ -269,27 +290,10 @@ export default function Home() {
                   <span className="material-symbols-outlined">download</span>
                   {dl.starting ? 'Starting…' : dl.active ? 'Downloading…' : 'Download'}
                 </button>
-                {dl.active && (
-                  <div className="flex flex-col gap-1.5">
-                    <div className="w-full h-2 rounded-full bg-surface-container-high overflow-hidden">
-                      <div
-                        className="h-full bg-secondary transition-all duration-300"
-                        style={{ width: `${Math.max(2, dl.percent)}%` }}
-                      />
-                    </div>
-                    <p className="font-label-sm text-label-sm text-on-surface-variant text-center">
-                      {dl.message} {dl.percent > 0 ? `(${Math.round(dl.percent)}%)` : ''}
-                    </p>
-                  </div>
-                )}
-                {dl.error && (
-                  <div>
-                    <p className="font-label-sm text-label-sm text-error text-center">{dl.error}</p>
-                    <p className="font-label-sm text-label-sm text-on-surface-variant text-center mt-1">
-                      {friendlyErrorHint(dl.error)}
-                    </p>
-                  </div>
-                )}
+                <p className="font-label-sm text-[11px] text-on-surface-variant text-center">
+                  Once it's ready, scroll up to the <span className="font-bold">Downloads</span> section to save it to your device.
+                </p>
+                
               </div>
             </section>
           )}
